@@ -1,11 +1,40 @@
 import os
 import sys
 
-# 必须在 import torch 之前，确保环境变量生效
+# 1. 基础环境配置 (去掉手动设备隔离，由 torchrun 处理)
 os.environ['ASCEND_GLOBAL_LOG_LEVEL'] = 'error' 
 os.environ['HCCL_WHITELIST_DISABLE'] = '1'
 os.environ['MASTER_ADDR'] = '127.0.0.1'
 os.environ['MASTER_PORT'] = '29505'
+
+import torch
+import torch_npu  # 必须先 import torch_npu
+import torch.distributed as dist
+
+# 2. 强制获取 LOCAL_RANK 并绑定
+# 注意：在 8 卡机跑 4 卡，torchrun 会给每个进程分配 LOCAL_RANK 为 0,1,2,3
+l_rank = int(os.environ.get("LOCAL_RANK", 0))
+
+import torch.nn as nn
+import torch.nn.functional as F
+
+# 补丁
+import torch.library
+if not hasattr(torch.library, "infer_schema"):
+    torch.library.infer_schema = lambda *args, **kwargs: None
+
+sys.path.append("/vllm-workspace/vllm")
+
+# 导入 vllm 相关组件
+from vllm.distributed import (
+    initialize_model_parallel,
+    ensure_model_parallel_initialized,
+    init_distributed_environment
+)
+from vllm.model_executor.models.deepseek_v2 import DeepseekV2MoE
+from transformers import DeepseekV2Config
+
+
 
 # --- 核心修复：强制获取正确的 local_rank ---
 def get_local_rank():
