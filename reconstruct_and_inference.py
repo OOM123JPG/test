@@ -6,6 +6,183 @@ import argparse
 import torch
 import torch.nn as nn
 import torch.distributed as dist
+from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
+
+# 环境初始化
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+curr_dir = os.path.dirname(os.path.abspath(__file__))
+proj_dir = os.path.dirname(curr_dir)
+sys.path.append(proj_dir)
+
+# ==============================================================================
+# 1. 定义 Tucker 专家层
+# ==============================================================================
+
+class TuckerDecomposedExpert(nn.Module):
+    def __init__(self, proj_name, core, factors, device="cpu"):
+        super().__init__()
+        self.proj_name = proj_name
+        # 强制 bf16 确保性能
+        self.u_in = nn.Parameter(factors[1].to(torch.bfloat16).to(device))
+        self.core = nn.Parameter(core.to(torch.bfloat16).to(device))
+        self.u_out = nn.Parameter(factors[2].to(torch.bfloat16).to(device))
+
+    def forward(self, x, expert_idx_in_group):
+        if x.shape[0] == 0:
+            return x
+        # [tokens, In_Dim] @ [In_Dim, Rank_In]
+        x = torch.matmul(x, self.u_in)
+        # [tokens, 1, Rank_In] @ [tokens, Rank_In, Rank_Out]
+        core_slices = self.core[expert_idx_in_group]
+        x = torch.bmm(x.unsqueeze(1), core_slices).squeeze(1)
+        # [tokens, Rank_Out] @ [Rank_Out, Out_Dim]
+        x = torch.matmul(x, self.u_out)
+        return x
+
+# ==============================================================================
+# 2. 流水线包装器 (实现双机交接)
+# ==============================================================================
+
+class PipelineWrapper(nn.Module):
+    def __init__(self, model, rank, world_size, active_layers_range):
+        super().__init__()
+        self.model = model
+        self.rank = rank
+        self.world_size = world_size
+        self.active_layers = active_layers_range
+        self.is_first_node = (rank < 8)  # 机器0处理前31层
+        self.is_last_node = (rank >= 8)  # 机器1处理后30层
+        
+        # 找到双机交接的邻居 (Rank 0-7 对应 8-15)
+        self.neighbor_rank = (rank + 8) % 16
+
+    def forward(self, input_ids, **kwargs):
+        # 机器0：执行初始 Embedding 和前一半层
+        if self.is_first_node:
+            outputs = self.model(input_ids=input_ids, **kwargs)
+            hidden_states = outputs[0] if isinstance(outputs, tuple) else outputs
+            # 同步发送给机器1
+            dist.send(tensor=hidden_states.dist(), dst=self.neighbor_rank)
+            return None # 机器0不负责生成最终结果
+            
+        # 机器1：接收中间结果并执行后一半层
+        else:
+            # 预分配空间接收 Tensor (根据 SeqLen 和 HiddenSize 调整)
+            shape = [input_ids.shape[0], input_ids.shape[1], 7168] # DeepSeek-V3 HiddenSize=7168
+            hidden_states = torch.zeros(shape, dtype=torch.bfloat16).to(torch.npu.current_device())
+            dist.recv(tensor=hidden_states, src=self.neighbor_rank)
+            
+            # 从中间层开始继续推理 (注意：此处需要针对模型 forward 逻辑做微调)
+            return self.model(inputs_embeds=hidden_states, **kwargs)
+
+# ==============================================================================
+# 3. 动态替换逻辑
+# ==============================================================================
+
+def apply_tucker_to_model(model, decomp_dir, active_layers, device="cpu"):
+    n_group = 8
+    experts_per_group = 32
+
+    for layer_idx in active_layers:
+        layer = model.model.layers[layer_idx]
+        if not hasattr(layer.mlp, 'experts'): continue
+        
+        check_file = os.path.join(decomp_dir, f"layer_{layer_idx}_group_0.pt")
+        if not os.path.exists(check_file): continue
+
+        logging.info(f"Applying Tucker to Layer {layer_idx}...")
+        for g_idx in range(n_group):
+            decomp_path = os.path.join(decomp_dir, f"layer_{layer_idx}_group_{g_idx}.pt")
+            group_weights = torch.load(decomp_path, map_location="cpu")
+            
+            for exp_in_g in range(experts_per_group):
+                abs_exp_idx = g_idx * experts_per_group + exp_in_g
+                expert = layer.mlp.experts[abs_exp_idx]
+                for proj_name in ['gate_proj', 'up_proj', 'down_proj']:
+                    data = group_weights[proj_name]
+                    tucker_mod = TuckerDecomposedExpert(proj_name, data['core'], data['factors'], device)
+                    setattr(expert, proj_name, tucker_mod)
+            del group_weights
+            gc.collect()
+    return model
+
+# ==============================================================================
+# 4. 主函数 (PP=2 核心逻辑)
+# ==============================================================================
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model_path", type=str, required=True)
+    parser.add_argument("--decomp_dir", type=str, required=True)
+    parser.add_argument("--local_rank", type=int, default=-1)
+    args = parser.parse_args()
+
+    # 初始化分布式环境
+    if args.local_rank != -1:
+        torch.npu.set_device(args.local_rank)
+        dist.init_process_group(backend="hccl")
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+    else:
+        rank, world_size = 0, 1
+        torch.npu.set_device(0)
+
+    # 1. 确定层范围 (DeepSeek-V3 总计 62 层, 0-61)
+    total_layers = 62
+    mid = total_layers // 2
+    if rank < 8:
+        active_range = range(0, mid) # 机器0: 0-30层
+    else:
+        active_range = range(mid, total_layers) # 机器1: 31-61层
+
+    # 2. 加载 Config 并通过 Low_resource 模式实例化
+    config = AutoConfig.from_pretrained(args.model_path, trust_remote_code=True)
+    
+    logging.info(f"Rank {rank}: Initializing partial layers {list(active_range)}")
+    
+    with torch.device("meta"): # 使用 meta device 极速创建空框架，不占内存
+        model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
+
+    # 3. 内存搬运：只将需要的层搬到真实设备 (CPU/NPU) 并替换 Tucker
+    # 注意：此步需要逐层加载权重，避免一次性加载全量 checkpoint
+    # 此处演示为“结构重组”，实际需配合你的权重加载逻辑
+    model = apply_tucker_to_model(model, args.decomp_dir, active_range, device="cpu")
+    
+    # 4. 包装流水线
+    wrapped_model = PipelineWrapper(model, rank, world_size, active_range)
+    wrapped_model.to(torch.npu.current_device())
+
+    # 5. 推理入口
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+    
+    if rank == 0: # 只有 Rank 0 输入 Prompt
+        text = "Write a quicksort in Python."
+        inputs = tokenizer(text, return_tensors="pt").to(torch.npu.current_device())
+        logging.info("Rank 0: Starting inference...")
+        with torch.no_grad():
+            # 这里的 generate 需要根据 PipelineWrapper 逻辑修改
+            # 简单演示流程：
+            wrapped_model(input_ids=inputs['input_ids'])
+    
+    elif rank == 8: # Rank 8 接收并打印
+        logging.info("Rank 8: Waiting for data from Node 0...")
+        with torch.no_grad():
+            # 接收机器0的信号并继续
+            # 注意：实际 generate 循环需要更复杂的控制流
+            dummy_input = torch.zeros((1, 1), dtype=torch.long).to(torch.npu.current_device())
+            output = wrapped_model(input_ids=dummy_input)
+            if output is not None:
+                print(tokenizer.decode(output[0], skip_special_tokens=True))
+
+if __name__ == "__main__":
+    main()import os
+import sys
+import gc
+import logging
+import argparse
+import torch
+import torch.nn as nn
+import torch.distributed as dist
 from transformers import AutoConfig, AutoTokenizer
 
 # 环境初始化
