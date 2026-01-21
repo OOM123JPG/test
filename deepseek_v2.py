@@ -1,3 +1,5 @@
+from vllm.distributed import tensor_model_parallel_all_reduce, get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
+
 class DistributedTuckerLinear(nn.Module):
     def __init__(self, data, proj_type="gate_up", tp_size=1, tp_rank=0):
         super().__init__()
@@ -5,19 +7,17 @@ class DistributedTuckerLinear(nn.Module):
         self.tp_size = tp_size
         self.tp_rank = tp_rank
         
-        # 1. 加载因子 U_E 和 Core (压缩后极小，直接上 NPU)
-        # data['factors'][0] 是 U_E, data['core'] 是 Core
+        # 1. 加载因子和 Core (CPU -> NPU)
         self.register_buffer('U_E', data['factors'][0].to(torch.bfloat16).to("npu"))
         self.register_buffer('core', data['core'].to(torch.bfloat16).to("npu"))
 
-        # 2. 真正的分片加载：先在 CPU 切分，再上 NPU
-        u_h_raw = data['factors'][1] # CPU tensor: [Hidden, Rank]
-        u_i_raw = data['factors'][2] # CPU tensor: [Hidden, Rank]
+        # 2. 真正的分片加载：先在 CPU 切分，再上 NPU 释放内存
+        u_h_raw = data['factors'][1] 
+        u_i_raw = data['factors'][2] 
         
         r_h, r_i = u_h_raw.shape[1], u_i_raw.shape[1]
         r_h_shard, r_i_shard = r_h // tp_size, r_i // tp_size
 
-        # 3. 按 Rank 维度切片并移动到 NPU
         if proj_type == "gate_up":
             self.register_buffer('U_I', u_i_raw[:, tp_rank * r_i_shard : (tp_rank + 1) * r_i_shard].to(torch.bfloat16).to("npu").contiguous())
             self.register_buffer('U_H', u_h_raw[:, tp_rank * r_h_shard : (tp_rank + 1) * r_h_shard].to(torch.bfloat16).to("npu").contiguous())
@@ -26,29 +26,20 @@ class DistributedTuckerLinear(nn.Module):
             self.register_buffer('U_I', u_i_raw[:, tp_rank * r_i_shard : (tp_rank + 1) * r_i_shard].to(torch.bfloat16).to("npu").contiguous())
 
     def forward(self, x, expert_inner_indices):
-        # x: [Tokens, Hidden_dim]
-        # ue: [Tokens, Rank_E]
         ue = self.U_E[expert_inner_indices]
         r_h, r_i = self.core.shape[1], self.core.shape[2]
-        
-        # 将 Core 与 U_E 结合得到动态 Core: [Tokens, r_h, r_i]
         combined_core = torch.matmul(ue, self.core.view(self.core.shape[0], -1)).view(-1, r_h, r_i)
 
         r_h_shard, r_i_shard = r_h // self.tp_size, r_i // self.tp_size
 
         if self.proj_type == "gate_up":
-            # Step 1: 映射到低维 [Tokens, r_i_shard]
             x_low = torch.matmul(x, self.U_I)
-            # Step 2: 与 Core 计算中间结果
             core_shard = combined_core[:, :, self.tp_rank * r_i_shard : (self.tp_rank + 1) * r_i_shard]
             mid = torch.bmm(x_low.unsqueeze(1), core_shard.transpose(1, 2)).squeeze(1)
-            # Step 3: TP 组内同步
             mid = tensor_model_parallel_all_reduce(mid)
-            # Step 4: 映射回高维分片
             mid_shard = mid[:, self.tp_rank * r_h_shard : (self.tp_rank + 1) * r_h_shard]
             return torch.matmul(mid_shard, self.U_H.T)
         else:
-            # Down Projection 逻辑
             x_low = torch.matmul(x, self.U_H)
             core_shard = combined_core[:, self.tp_rank * r_h_shard : (self.tp_rank + 1) * r_h_shard, :]
             mid = torch.bmm(x_low.unsqueeze(1), core_shard).squeeze(1)
