@@ -4,3 +4,26 @@
 
 
 https://gitcode.com/Ascend/MindIE-LLM/blob/master/examples/atb_models/examples/models/deepseek-v3/README.md
+
+
+docker run -it -d \
+    --name deepseek_tucker \
+    --net=host \
+    --shm-size=128g \
+    --privileged \
+    -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+    -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
+    -v /home/models:/home/models \
+    -v /home/your_code:/home/your_code \
+    --device=/dev/davinci0 \
+    --device=/dev/davinci1 \
+    --device=/dev/davinci2 \
+    --device=/dev/davinci3 \
+    --device=/dev/davinci4 \
+    --device=/dev/davinci5 \
+    --device=/dev/davinci6 \
+    --device=/dev/davinci7 \
+    --device=/dev/davinci_manager \
+    --device=/dev/devmm_svm \
+    --device=/dev/hisi_hdc \
+    ascend-mindie:latest /bin/bash
