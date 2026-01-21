@@ -51,115 +51,54 @@ class DistributedTuckerLinear(nn.Module):
 
 
 class DeepseekV2MoE(nn.Module):
-    def __init__(
-        self,
-        config: DeepseekV2Config | DeepseekV3Config,
-        parallel_config: ParallelConfig,
-        quant_config: QuantizationConfig | None = None,
-        prefix: str = "",
-        layer_idx: int = -1,
-    ):
+    def __init__(self, config, parallel_config, quant_config=None, prefix="", layer_idx=-1):
         super().__init__()
+        # 1. 确保并行状态已初始化
         self.tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()
 
+        # 2. 基础配置
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
-
         self.ep_group = get_ep_group().device_group
         self.ep_rank = get_ep_group().rank_in_group
         self.ep_size = self.ep_group.size()
-        self.n_routed_experts: int = config.n_routed_experts
-        self.n_shared_experts: int = config.n_shared_experts
-
-        self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
+        self.n_routed_experts = config.n_routed_experts
         self.top_k = config.num_experts_per_tok
 
-        # --- Tucker 状态初始化 ---
+        # 3. Tucker 状态
         self.layer_idx = layer_idx
-        self.use_tucker_cfg = getattr(config, "use_tucker", False)
-        self.tucker_layers = getattr(config, "tucker_layers", [])
-        self.is_tucker_active = (self.use_tucker_cfg and self.layer_idx in self.tucker_layers)
+        self.is_tucker_active = (getattr(config, "use_tucker", False) and 
+                                 self.layer_idx in getattr(config, "tucker_layers", []))
 
-        self.gate = ReplicatedLinear(
-            config.hidden_size,
-            config.n_routed_experts,
-            bias=False,
-            quant_config=None,
-            prefix=f"{prefix}.gate",
-        )
-        self.gate.e_score_correction_bias = nn.Parameter(
-            torch.empty(config.n_routed_experts, dtype=torch.float32)
-        ) if getattr(config, "topk_method", None) == "noaux_tc" else None
-
-        eplb_config = parallel_config.eplb_config
-        self.enable_eplb = parallel_config.enable_eplb
-        self.n_redundant_experts = eplb_config.num_redundant_experts
-        self.n_local_physical_experts = (self.n_routed_experts + self.n_redundant_experts) // self.ep_size
-
-        if config.n_shared_experts is not None:
-            self.shared_experts = DeepseekV2MLP(
-                hidden_size=config.hidden_size,
-                intermediate_size=config.moe_intermediate_size * config.n_shared_experts,
-                hidden_act=config.hidden_act,
-                quant_config=quant_config,
-                is_sequence_parallel=self.is_sequence_parallel,
-                reduce_results=False,
-                prefix=f"{prefix}.shared_experts",
-            )
-        else:
-            self.shared_experts = None
-
-        self.experts = SharedFusedMoE(
-            shared_experts=self.shared_experts,
-            gate=self.gate,
-            num_experts=config.n_routed_experts,
-            top_k=config.num_experts_per_tok,
-            hidden_size=config.hidden_size,
-            intermediate_size=config.moe_intermediate_size,
-            reduce_results=False,
-            renormalize=config.norm_topk_prob,
-            quant_config=quant_config,
-            use_grouped_topk=True,
-            num_expert_group=getattr(config, "n_group", 1),
-            topk_group=getattr(config, "topk_group", 1),
-            prefix=f"{prefix}.experts",
-            scoring_func=getattr(config, "scoring_func", "softmax"),
-            routed_scaling_factor=1.0,
-            e_score_correction_bias=self.gate.e_score_correction_bias,
-            enable_eplb=self.enable_eplb,
-            num_redundant_experts=self.n_redundant_experts,
-            is_sequence_parallel=self.is_sequence_parallel,
-        )
-
-        # --- Tucker 权重异步加载 (TP4 兼容版) ---
+        # 4. 加载专家逻辑
         self.tucker_experts = nn.ModuleDict()
         if self.is_tucker_active:
-            # --- 核心改进：分时错峰加载 ---
-            # 根据 rank 错开时间，每张卡间隔 10 秒（给 NFS 缓冲时间）
-            wait_time = self.tp_rank * 10 
-            if self.tp_rank == 0:
-                print(f"[TUCKER] 为了减轻 NFS 压力，采用错峰加载模式...")
+            tucker_path = getattr(config, "tucker_path", "/nfs-share/wx1463835/tdmoe/output/decomp_results")
             
-            time.sleep(wait_time) 
+            # 确定当前卡负责的专家组
+            groups_per_ep = 8 // self.ep_size
+            my_group_ids = range(self.ep_rank * groups_per_ep, (self.ep_rank + 1) * groups_per_ep)
+
+            # 错峰加载防止 NFS 崩溃
+            time.sleep(self.tp_rank * 5) # 稍微缩短间隔
             
             for g_id in my_group_ids:
                 f_path = os.path.join(tucker_path, f"layer_{self.layer_idx}_group_{g_id}.pt")
                 if os.path.exists(f_path):
-                    print(f"[TUCKER Rank {self.tp_rank}] 正在读取: {f_path}")
-                    # 必须使用 map_location='cpu'，先在 CPU 完成分片，再上 NPU
+                    # 必须 map_location='cpu'
                     data = torch.load(f_path, map_location='cpu')
-                    
+                    # 修正变量名为 self.tp_size 和 self.tp_rank
                     self.tucker_experts[str(g_id)] = nn.ModuleDict({
-                        'gate': DistributedTuckerLinear(data['gate_proj'], "gate_up", curr_tp_size, curr_tp_rank),
-                        'up':   DistributedTuckerLinear(data['up_proj'],   "gate_up", curr_tp_size, curr_tp_rank),
-                        'down': DistributedTuckerLinear(data['down_proj'], "down",    curr_tp_size, curr_tp_rank),
+                        'gate': DistributedTuckerLinear(data['gate_proj'], "gate_up", self.tp_size, self.tp_rank),
+                        'up':   DistributedTuckerLinear(data['up_proj'],   "gate_up", self.tp_size, self.tp_rank),
+                        'down': DistributedTuckerLinear(data['down_proj'], "down",    self.tp_size, self.tp_rank),
                     })
                     del data
                     if self.tp_rank == 0:
-                        print(f"[TUCKER] 成功发现并分片加载: {f_path}")
+                        print(f"[TUCKER] Layer {self.layer_idx} Group {g_id} 加载成功")
                 else:
                     if self.tp_rank == 0:
-                        print(f"[TUCKER] 警告: 找不到文件 {f_path}")
+                        print(f"[TUCKER] 警告: 找不到文件 {f_path}")}")
 
     def forward_tucker(self, hidden_states, router_logits):
         import torch.nn.functional as F
