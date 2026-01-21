@@ -1,5 +1,17 @@
 import os
 import sys
+
+# 强制修正环境变量
+rank = int(os.environ.get("RANK", 0))
+if os.environ.get("LOCAL_RANK") in [None, "-1"]:
+    # 强制让 LOCAL_RANK 等于 RANK % 8 (单机 8 卡环境)
+    os.environ["LOCAL_RANK"] = str(rank % 8)
+
+# 打印确认
+print(f"[BOOTSTRAP] Rank: {os.environ.get('RANK')}, LocalRank: {os.environ.get('LOCAL_RANK')}")
+
+
+import sys
 from datetime import timedelta
 
 # 1. 强制环境对齐 (必须最先执行)
