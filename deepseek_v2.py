@@ -134,27 +134,27 @@ class DeepseekV2MoE(nn.Module):
         # --- Tucker 权重异步加载 (TP4 兼容版) ---
         self.tucker_experts = nn.ModuleDict()
         if self.is_tucker_active:
-            tucker_path = "/nfs-share/wx1463835/tdmoe/output/decomp_results"
-            
-            # 在此处安全获取并传参
-            curr_tp_size = max(1, self.tp_size)
-            curr_tp_rank = self.tp_rank
-            
-            groups_per_ep = 8 // self.ep_size
-            my_group_ids = range(self.ep_rank * groups_per_ep, (self.ep_rank + 1) * groups_per_ep)
-            
+            # --- 核心改进：分时错峰加载 ---
+            # 根据 rank 错开时间，每张卡间隔 10 秒（给 NFS 缓冲时间）
+            wait_time = self.tp_rank * 10 
             if self.tp_rank == 0:
-                print(f"\n[TUCKER] 加载 Layer {self.layer_idx}, TP_Size={curr_tp_size}, 组={list(my_group_ids)}")
-
+                print(f"[TUCKER] 为了减轻 NFS 压力，采用错峰加载模式...")
+            
+            time.sleep(wait_time) 
+            
             for g_id in my_group_ids:
                 f_path = os.path.join(tucker_path, f"layer_{self.layer_idx}_group_{g_id}.pt")
                 if os.path.exists(f_path):
+                    print(f"[TUCKER Rank {self.tp_rank}] 正在读取: {f_path}")
+                    # 必须使用 map_location='cpu'，先在 CPU 完成分片，再上 NPU
                     data = torch.load(f_path, map_location='cpu')
+                    
                     self.tucker_experts[str(g_id)] = nn.ModuleDict({
                         'gate': DistributedTuckerLinear(data['gate_proj'], "gate_up", curr_tp_size, curr_tp_rank),
                         'up':   DistributedTuckerLinear(data['up_proj'],   "gate_up", curr_tp_size, curr_tp_rank),
                         'down': DistributedTuckerLinear(data['down_proj'], "down",    curr_tp_size, curr_tp_rank),
                     })
+                    del data
                     if self.tp_rank == 0:
                         print(f"[TUCKER] 成功发现并分片加载: {f_path}")
                 else:
