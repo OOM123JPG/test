@@ -5,28 +5,24 @@ from vllm.distributed import (get_tensor_model_parallel_rank,
                               tensor_model_parallel_all_reduce)
 
 class DistributedTuckerLinear(nn.Module):
-    def __init__(self, data, proj_type="gate_up"):
+    def __init__(self, data, proj_type="gate_up", tp_size=1, tp_rank=0):
         super().__init__()
         self.proj_type = proj_type
+        self.tp_size = tp_size
+        self.tp_rank = tp_rank
         
-        # 必须在初始化模型前已经调过 initialize_model_parallel
-        tp_size = get_tensor_model_parallel_world_size() 
-        tp_rank = get_tensor_model_parallel_rank()
-        
-        # 1. 加载因子 U_E 和 Core (CPU -> NPU)
+        # 1. 加载因子和 Core
         self.register_buffer('U_E', data['factors'][0].to(torch.bfloat16).to("npu"))
         self.register_buffer('core', data['core'].to(torch.bfloat16).to("npu"))
 
-        # 2. 真正的分片加载：先在 CPU 切分，再上 NPU
-        u_h_raw = data['factors'][1] # 此时在 CPU
-        u_i_raw = data['factors'][2] # 此时在 CPU
+        # 2. 真正的分片加载逻辑
+        u_h_raw = data['factors'][1]
+        u_i_raw = data['factors'][2]
         
         r_h, r_i = u_h_raw.shape[1], u_i_raw.shape[1]
         r_h_shard, r_i_shard = r_h // tp_size, r_i // tp_size
 
-        # 只把属于自己的切片移到 NPU
         if proj_type == "gate_up":
-            # U_I 和 U_H 都按 Rank 维度切分
             self.register_buffer('U_I', u_i_raw[:, tp_rank * r_i_shard : (tp_rank + 1) * r_i_shard].to(torch.bfloat16).to("npu").contiguous())
             self.register_buffer('U_H', u_h_raw[:, tp_rank * r_h_shard : (tp_rank + 1) * r_h_shard].to(torch.bfloat16).to("npu").contiguous())
         else:
@@ -34,34 +30,52 @@ class DistributedTuckerLinear(nn.Module):
             self.register_buffer('U_I', u_i_raw[:, tp_rank * r_i_shard : (tp_rank + 1) * r_i_shard].to(torch.bfloat16).to("npu").contiguous())
 
     def forward(self, x, expert_inner_indices):
-        # 这里的计算逻辑基本正确
-        # combined_core: [batch, r_h, r_i]
+        # ... 这里的计算逻辑保持不变，但使用 self.tp_size / self.tp_rank ...
         ue = self.U_E[expert_inner_indices]
         r_h, r_i = self.core.shape[1], self.core.shape[2]
         combined_core = torch.matmul(ue, self.core.view(self.core.shape[0], -1)).view(-1, r_h, r_i)
 
-        tp_size = get_tensor_model_parallel_world_size()
-        tp_rank = get_tensor_model_parallel_rank()
-        r_h_shard, r_i_shard = r_h // tp_size, r_i // tp_size
+        r_h_shard, r_i_shard = r_h // self.tp_size, r_i // self.tp_size
 
         if self.proj_type == "gate_up":
-            # 1. 映射到低维: x[D] * U_I[D, r_i/4] -> x_low[r_i/4]
             x_low = torch.matmul(x, self.U_I)
-            # 2. 与 Core 乘: 
-            core_shard = combined_core[:, :, tp_rank * r_i_shard : (tp_rank + 1) * r_i_shard]
+            core_shard = combined_core[:, :, self.tp_rank * r_i_shard : (self.tp_rank + 1) * r_i_shard]
             mid = torch.bmm(x_low.unsqueeze(1), core_shard.transpose(1, 2)).squeeze(1)
-            # 3. TP 同步
-            mid = tensor_model_parallel_all_reduce(mid)
-            # 4. 映射回高维
-            mid_shard = mid[:, tp_rank * r_h_shard : (tp_rank + 1) * r_h_shard]
+            mid = tensor_model_parallel_all_reduce(mid) # 这个函数在 forward 里调是安全的
+            mid_shard = mid[:, self.tp_rank * r_h_shard : (self.tp_rank + 1) * r_h_shard]
             return torch.matmul(mid_shard, self.U_H.T)
         else:
-            # Down 投影逻辑同理
+            # Down 逻辑同理
             x_low = torch.matmul(x, self.U_H)
-            core_shard = combined_core[:, tp_rank * r_h_shard : (tp_rank + 1) * r_h_shard, :]
+            core_shard = combined_core[:, self.tp_rank * r_h_shard : (self.tp_rank + 1) * r_h_shard, :]
             mid = torch.bmm(x_low.unsqueeze(1), core_shard).squeeze(1)
             mid = tensor_model_parallel_all_reduce(mid)
-            mid_shard = mid[:, tp_rank * r_i_shard : (tp_rank + 1) * r_i_shard]
+            mid_shard = mid[:, self.tp_rank * r_i_shard : (self.tp_rank + 1) * r_i_shard]
             return torch.matmul(mid_shard, self.U_I.T)
 ```
+
+# DeepseekV2MoE.__init__
+```
+# 在 DeepseekV2MoE.__init__ 内部
+if self.is_tucker_active:
+    # 此时 initialize_model_parallel 已经在脚本里调过了，这里获取是安全的
+    current_tp_size = get_tensor_model_parallel_world_size()
+    current_tp_rank = get_tensor_model_parallel_rank()
+
+    for g_id in my_group_ids:
+        # ...
+        if os.path.exists(f_path):
+            data = torch.load(f_path, map_location='cpu')
+            self.tucker_experts[str(g_id)] = nn.ModuleDict({
+                'gate': DistributedTuckerLinear(data['gate_proj'], "gate_up", 
+                                               tp_size=current_tp_size, tp_rank=current_tp_rank),
+                'up':   DistributedTuckerLinear(data['up_proj'], "gate_up", 
+                                               tp_size=current_tp_size, tp_rank=current_tp_rank),
+                'down': DistributedTuckerLinear(data['down_proj'], "down", 
+                                               tp_size=current_tp_size, tp_rank=current_tp_rank),
+            })
+```
+
 torchrun --nproc_per_node=4            
+
+检查 test_tucker_layer.py：确认 initialize_model_parallel 在 DeepseekV2MoE 之前运行。
