@@ -56,24 +56,67 @@ class DistributedTuckerLinear(nn.Module):
 
 # DeepseekV2MoE.__init__
 ```
-# 在 DeepseekV2MoE.__init__ 内部
-if self.is_tucker_active:
-    # 此时 initialize_model_parallel 已经在脚本里调过了，这里获取是安全的
-    current_tp_size = get_tensor_model_parallel_world_size()
-    current_tp_rank = get_tensor_model_parallel_rank()
+# --- Tucker 权重异步加载与 TP4 分片配置 ---
+        if self.is_tucker_active:
+            # 1. 获取基础路径与分布式状态
+            tucker_path = getattr(config, "tucker_path", "/home/GZGKD001/tmp/yanhong/tdmoe_deepseek/output/decomp_results")
+            
+            # 安全获取 TP/EP 状态 (此时 initialize_model_parallel 必须已完成)
+            try:
+                current_tp_size = get_tensor_model_parallel_world_size()
+                current_tp_rank = get_tensor_model_parallel_rank()
+                # 兼容单机测试：如果获取失败(size=0)，强制设为 1
+                current_tp_size = max(1, current_tp_size)
+            except Exception:
+                current_tp_size, current_tp_rank = 1, 0
 
-    for g_id in my_group_ids:
-        # ...
-        if os.path.exists(f_path):
-            data = torch.load(f_path, map_location='cpu')
-            self.tucker_experts[str(g_id)] = nn.ModuleDict({
-                'gate': DistributedTuckerLinear(data['gate_proj'], "gate_up", 
-                                               tp_size=current_tp_size, tp_rank=current_tp_rank),
-                'up':   DistributedTuckerLinear(data['up_proj'], "gate_up", 
-                                               tp_size=current_tp_size, tp_rank=current_tp_rank),
-                'down': DistributedTuckerLinear(data['down_proj'], "down", 
-                                               tp_size=current_tp_size, tp_rank=current_tp_rank),
-            })
+            # 计算本卡需要加载的专家组 (EP 逻辑)
+            ep_size_val = max(1, self.ep_size)
+            groups_per_ep = 8 // ep_size_val
+            my_group_ids = range(self.ep_rank * groups_per_ep, (self.ep_rank + 1) * groups_per_ep)
+            
+            self.tucker_experts = nn.ModuleDict()
+
+            if self.tp_rank == 0:
+                print(f"\n[TUCKER INIT] Layer {self.layer_idx} | TP_Size: {current_tp_size} | TP_Rank: {current_tp_rank}")
+                print(f"[TUCKER INIT] 计划加载专家组: {list(my_group_ids)}")
+
+            # 2. 遍历并加载权重
+            for g_id in my_group_ids:
+                f_path = os.path.join(tucker_path, f"layer_{self.layer_idx}_group_{g_id}.pt")
+                
+                if os.path.exists(f_path):
+                    if self.tp_rank == 0:
+                        print(f"[TUCKER INIT] 正在分片加载 Group {g_id}: {f_path}")
+                    
+                    # 必须 map_location='cpu'，防止全量瞬间挤爆 NPU 0
+                    data = torch.load(f_path, map_location='cpu')
+                    
+                    # 实例化 Tucker 专家，并显式传入 tp 信息
+                    # 内部 DistributedTuckerLinear 会处理 CPU -> NPU 的分片
+                    self.tucker_experts[str(g_id)] = nn.ModuleDict({
+                        'gate': DistributedTuckerLinear(
+                            data['gate_proj'], "gate_up", 
+                            tp_size=current_tp_size, tp_rank=current_tp_rank
+                        ),
+                        'up': DistributedTuckerLinear(
+                            data['up_proj'], "gate_up", 
+                            tp_size=current_tp_size, tp_rank=current_tp_rank
+                        ),
+                        'down': DistributedTuckerLinear(
+                            data['down_proj'], "down", 
+                            tp_size=current_tp_size, tp_rank=current_tp_rank
+                        ),
+                    })
+                    
+                    # 加载完成后立即从内存删除 data 对象，释放 CPU 内存
+                    del data
+                else:
+                    if self.tp_rank == 0:
+                        print(f"[TUCKER INIT] 警告：找不到文件 {f_path}，该专家组将无法运行")
+
+            if self.tp_rank == 0:
+                print(f"[TUCKER INIT] Layer {self.layer_idx} 加载完成，实际命中组数: {len(self.tucker_experts)}\n")
 ```
 
 torchrun --nproc_per_node=4            
