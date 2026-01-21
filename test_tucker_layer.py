@@ -110,3 +110,5 @@ def run_test():
 
 if __name__ == "__main__":
     run_test()
+
+# HCCL_DEBUG=1 torchrun --nproc_per_node=4 test_tucker_layer.py
