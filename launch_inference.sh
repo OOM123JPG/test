@@ -33,3 +33,22 @@ torchrun --nnodes=2 --node_rank=0 --nproc_per_node=8 --master_addr=192.168.1.10 
 机器 1 (192.168.1.11):
 export HCCL_IF_IP=192.168.1.11
 torchrun --nnodes=2 --node_rank=1 --nproc_per_node=8 --master_addr=192.168.1.10 --master_port=29500 src/reconstruct_and_inference.py --model_path /models/ds-v3 --decomp_dir ./output/decomp_results
+
+
+###########################################
+第一步：在机器 0 的终端执行（假设 IP 为 192.168.1.10）：
+
+Bash
+export HCCL_IF_IP=192.168.1.10
+torchrun --nnodes=2 --node_rank=0 --nproc_per_node=8 \
+--master_addr=192.168.1.10 --master_port=29500 \
+src/test_hccl.py
+(此时终端会进入等待状态，因为它在等另外 8 个进程加入)
+
+第二步：在机器 1 的终端执行（假设 IP 为 192.168.1.11）：
+
+Bash
+export HCCL_IF_IP=192.168.1.11
+torchrun --nnodes=2 --node_rank=1 --nproc_per_node=8 \
+--master_addr=192.168.1.10 --master_port=29500 \
+src/test_hccl.py
