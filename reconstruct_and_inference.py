@@ -1,28 +1,21 @@
-import sys
-from unittest.mock import MagicMock
-
-# 模拟 flash_attn 模块，防止模型加载时报错
-mock_flash_attn = MagicMock()
-sys.modules["flash_attn"] = mock_flash_attn
-sys.modules["flash_attn.flash_attn_interface"] = mock_flash_attn
-
-# 环境初始化
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-curr_dir = os.path.dirname(os.path.abspath(__file__))
-proj_dir = os.path.dirname(curr_dir)
-sys.path.append(proj_dir)
-
 import os
 import sys
 import gc
 import logging
 import argparse
+
+# 必须先 import torch 和 torch_npu
 import torch
 import torch_npu
+
+# 针对 910B 的关键优化配置
+# jit_compile=False 表示使用二进制算子，避免在线编译导致的 FlashAttention 算子缺失或死锁
+torch.npu.set_compile_mode(jit_compile=False) 
+
+# 继续原有的导入
+from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
 import torch.nn as nn
 import torch.distributed as dist
-from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
-
 
 
 # ==============================================================================
