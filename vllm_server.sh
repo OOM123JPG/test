@@ -1,16 +1,24 @@
-ray start --head --node-ip-address 7.242.104.207 --port 6379
-ray start --address 7.242.104.207:6379 --node-ip-address 7.242.109.127
+### 昇腾双机分布式部署指令集 (TP8 PP4)
 
-# 在两台机器的终端分别执行：
-export HCCL_IF_IP=$(hostname -I | awk '{print $1}') # 自动获取内网IP
-export TP_SOCKET_IFNAME=eth0   # 请根据 ifconfig 确认你的网卡名
+---
+
+#### 1. Node 0 (7.242.104.207) - 主节点指令
+# 第一步：清理环境
+pkill -9 python3
+pkill -9 ray
+
+# 第二步：配置环境变量 (请确认网卡名 eth0 是否正确)
+export ASCEND_GLOBAL_LOG_LEVEL=error
 export HCCL_WHITELIST_DISABLE=1
 export HCCL_DETERMINISTIC=1
+export HCCL_IF_IP=7.242.104.207
+export TP_SOCKET_IFNAME=eth0
 export HCCL_CONNECT_TIMEOUT=300
 
-# Node0
-pkill -9 python
+# 第三步：启动 Ray Head 节点
+ray start --head --node-ip-address 7.242.104.207 --port 6379
 
+# 第四步：启动 vLLM 服务 (等待 Node 1 加入后执行)
 python3 -m vllm.entrypoints.openai.api_server \
     --model /home/GZGKD001/tmp/models/DeepSeek-V3-bf16 \
     --tensor-parallel-size 8 \
@@ -21,6 +29,22 @@ python3 -m vllm.entrypoints.openai.api_server \
     --gpu-memory-utilization 0.90 \
     --distributed-executor-backend ray \
     --enforce-eager \
-    --served-model-name deepseek-v3-tucker \
-    --block-size 16 \
-    --disable-log-requests
+    --served-model-name deepseek-v3-tucker
+
+---
+
+#### 2. Node 1 (7.242.109.127) - 工作节点指令
+# 第一步：清理环境
+pkill -9 python3
+pkill -9 ray
+
+# 第二步：配置环境变量
+export ASCEND_GLOBAL_LOG_LEVEL=error
+export HCCL_WHITELIST_DISABLE=1
+export HCCL_DETERMINISTIC=1
+export HCCL_IF_IP=7.242.109.127
+export TP_SOCKET_IFNAME=eth0
+export HCCL_CONNECT_TIMEOUT=300
+
+# 第三步：加入 Ray 集群
+ray start --address 7.242.104.207:6379 --node-ip-address 7.242.109.127
