@@ -4,9 +4,18 @@ import gc
 import logging
 import argparse
 import torch
+import torch_npu
 import torch.nn as nn
 import torch.distributed as dist
 from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
+
+import sys
+from unittest.mock import MagicMock
+
+# 模拟 flash_attn 模块，防止模型加载时报错
+mock_flash_attn = MagicMock()
+sys.modules["flash_attn"] = mock_flash_attn
+sys.modules["flash_attn.flash_attn_interface"] = mock_flash_attn
 
 # 环境初始化
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
