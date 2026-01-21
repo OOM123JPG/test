@@ -3,21 +3,17 @@
 ---
 
 #### 1. Node 0 (7.242.104.207) - 主节点指令
-# 1. 彻底清理残留
+# 1. 彻底清理
 pkill -9 python3 && pkill -9 ray
 
-# 2. 写入 Hosts 映射 (如果报错权限不足请手动 sudo vi /etc/hosts)
-echo "7.242.104.207 node0" >> /etc/hosts
-echo "7.242.109.127 node1" >> /etc/hosts
-
-# 3. 配置环境变量
+# 2. 设置环境变量 (延用你之前的成功设置)
 export ASCEND_GLOBAL_LOG_LEVEL=error
 export HCCL_WHITELIST_DISABLE=1
 export HCCL_IF_IP=7.242.104.207
-export TP_SOCKET_IFNAME=eth0
+export TP_SOCKET_IFNAME=eth0   # 确保这是你 torchrun 时用的网卡
 export HCCL_CONNECT_TIMEOUT=300
 
-# 4. 启动 Ray Head (强制指定 IP)
+# 3. 启动 Ray Head (强制指定物理 IP 避免解析失败)
 ray start --head --node-ip-address 7.242.104.207 --port 6379
 
 # 第四步：启动 vLLM 服务 (等待 Node 1 加入后执行)
@@ -36,21 +32,17 @@ ray start --head --node-ip-address 7.242.104.207 --port 6379
 ---
 
 #### 2. Node 1 (7.242.109.127) - 工作节点指令
-# 1. 彻底清理残留
+# 1. 彻底清理
 pkill -9 python3 && pkill -9 ray
 
-# 2. 写入 Hosts 映射
-echo "7.242.104.207 node0" >> /etc/hosts
-echo "7.242.109.127 node1" >> /etc/hosts
-
-# 3. 配置环境变量
+# 2. 设置环境变量 (延用你之前的成功设置)
 export ASCEND_GLOBAL_LOG_LEVEL=error
 export HCCL_WHITELIST_DISABLE=1
 export HCCL_IF_IP=7.242.109.127
 export TP_SOCKET_IFNAME=eth0
 export HCCL_CONNECT_TIMEOUT=300
 
-# 4. 加入集群 (直接使用 Node 0 的物理 IP)
+# 3. 加入集群 (直接用 IP)
 ray start --address 7.242.104.207:6379 --node-ip-address 7.242.109.127
 
 
