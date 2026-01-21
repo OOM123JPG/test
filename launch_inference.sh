@@ -25,15 +25,11 @@ torchrun \
 ######################################
 
 
-机器 0 (192.168.1.10):
+export HCCL_IF_IP=7.242.104.207
+torchrun --nnodes=2 --node_rank=0 --nproc_per_node=8 --master_addr=7.242.104.207 --master_port=29500 src/reconstruct_and_inference.py --model_path /home/models/DeepSeek-V3-bf16 --decomp_dir ./output/decomp_results
 
-export HCCL_IF_IP=192.168.1.10
-torchrun --nnodes=2 --node_rank=0 --nproc_per_node=8 --master_addr=192.168.1.10 --master_port=29500 src/reconstruct_and_inference.py --model_path /models/ds-v3 --decomp_dir ./output/decomp_results
-
-机器 1 (192.168.1.11):
-export HCCL_IF_IP=192.168.1.11
-torchrun --nnodes=2 --node_rank=1 --nproc_per_node=8 --master_addr=192.168.1.10 --master_port=29500 src/reconstruct_and_inference.py --model_path /models/ds-v3 --decomp_dir ./output/decomp_results
-
+export HCCL_IF_IP=7.242.109.127
+torchrun --nnodes=2 --node_rank=1 --nproc_per_node=8 --master_addr=7.242.104.207 --master_port=29500 src/reconstruct_and_inference.py --model_path /home/models/DeepSeek-V3-bf16 --decomp_dir ./output/decomp_results
 
 ###########################################
 # 清理之前的残余进程
