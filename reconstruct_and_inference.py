@@ -1,14 +1,3 @@
-import os
-import sys
-import gc
-import logging
-import argparse
-import torch
-import torch_npu
-import torch.nn as nn
-import torch.distributed as dist
-from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
-
 import sys
 from unittest.mock import MagicMock
 
@@ -22,6 +11,19 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 curr_dir = os.path.dirname(os.path.abspath(__file__))
 proj_dir = os.path.dirname(curr_dir)
 sys.path.append(proj_dir)
+
+import os
+import sys
+import gc
+import logging
+import argparse
+import torch
+import torch_npu
+import torch.nn as nn
+import torch.distributed as dist
+from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
+
+
 
 # ==============================================================================
 # 1. 定义 Tucker 专家层
