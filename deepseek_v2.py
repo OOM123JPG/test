@@ -7,29 +7,30 @@ class DistributedTuckerLinear(nn.Module):
         self.tp_size = tp_size
         self.tp_rank = tp_rank
         
-        # 1. 加载因子和 Core (CPU -> NPU)
-        self.register_buffer('U_E', data['factors'][0].to(torch.bfloat16).to("npu"))
-        self.register_buffer('core', data['core'].to(torch.bfloat16).to("npu"))
+        # 只有在确认为当前设备后才移动到 NPU
+        device = torch.npu.current_device()
+        
+        self.register_buffer('U_E', data['factors'][0].to(torch.bfloat16).to(f"npu:{device}"))
+        self.register_buffer('core', data['core'].to(torch.bfloat16).to(f"npu:{device}"))
 
-        # 2. 真正的分片加载：先在 CPU 切分，再上 NPU 释放内存
         u_h_raw = data['factors'][1] 
         u_i_raw = data['factors'][2] 
-        
         r_h, r_i = u_h_raw.shape[1], u_i_raw.shape[1]
         r_h_shard, r_i_shard = r_h // tp_size, r_i // tp_size
 
+        # 真正的分片加载逻辑
         if proj_type == "gate_up":
-            self.register_buffer('U_I', u_i_raw[:, tp_rank * r_i_shard : (tp_rank + 1) * r_i_shard].to(torch.bfloat16).to("npu").contiguous())
-            self.register_buffer('U_H', u_h_raw[:, tp_rank * r_h_shard : (tp_rank + 1) * r_h_shard].to(torch.bfloat16).to("npu").contiguous())
+            self.register_buffer('U_I', u_i_raw[:, tp_rank * r_i_shard : (tp_rank + 1) * r_i_shard].to(torch.bfloat16).to(f"npu:{device}").contiguous())
+            self.register_buffer('U_H', u_h_raw[:, tp_rank * r_h_shard : (tp_rank + 1) * r_h_shard].to(torch.bfloat16).to(f"npu:{device}").contiguous())
         else:
-            self.register_buffer('U_H', u_h_raw[:, tp_rank * r_h_shard : (tp_rank + 1) * r_h_shard].to(torch.bfloat16).to("npu").contiguous())
-            self.register_buffer('U_I', u_i_raw[:, tp_rank * r_i_shard : (tp_rank + 1) * r_i_shard].to(torch.bfloat16).to("npu").contiguous())
+            self.register_buffer('U_H', u_h_raw[:, tp_rank * r_h_shard : (tp_rank + 1) * r_h_shard].to(torch.bfloat16).to(f"npu:{device}").contiguous())
+            self.register_buffer('U_I', u_i_raw[:, tp_rank * r_i_shard : (tp_rank + 1) * r_i_shard].to(torch.bfloat16).to(f"npu:{device}").contiguous())
 
     def forward(self, x, expert_inner_indices):
         ue = self.U_E[expert_inner_indices]
         r_h, r_i = self.core.shape[1], self.core.shape[2]
         combined_core = torch.matmul(ue, self.core.view(self.core.shape[0], -1)).view(-1, r_h, r_i)
-
+        
         r_h_shard, r_i_shard = r_h // self.tp_size, r_i // self.tp_size
 
         if self.proj_type == "gate_up":
