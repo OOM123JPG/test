@@ -75,30 +75,37 @@ class DeepseekV2MoE(nn.Module):
         if self.is_tucker_active:
             tucker_path = getattr(config, "tucker_path", "/nfs-share/wx1463835/tdmoe/output/decomp_results")
             
-            # 确定当前卡负责的专家组
+            # [修正 1] 只有获取到 ep_group 后才能计算 my_group_ids
             groups_per_ep = 8 // self.ep_size
             my_group_ids = range(self.ep_rank * groups_per_ep, (self.ep_rank + 1) * groups_per_ep)
 
-            # 错峰加载防止 NFS 崩溃
-            time.sleep(self.tp_rank * 5) # 稍微缩短间隔
+            # [修正 2] 错峰加载时间不宜过长，且每个 Rank 打印进度以便排查
+            time.sleep(self.tp_rank * 2) # 间隔缩短到 2 秒，防止触发 HCCL 超时
             
+            if self.tp_rank == 0:
+                print(f"[TUCKER] Layer {self.layer_idx} 开始错峰加载，路径: {tucker_path}")
+
             for g_id in my_group_ids:
                 f_path = os.path.join(tucker_path, f"layer_{self.layer_idx}_group_{g_id}.pt")
                 if os.path.exists(f_path):
-                    # 必须 map_location='cpu'
+                    # [修正 3] 打印详细进度，你会看到显存随着这行打印开始跳变
+                    print(f"[TUCKER Rank {self.tp_rank}] 正在读取 Group {g_id}...") 
+                    
+                    # 确保在 CPU 上加载，避免 4 卡同时挤爆 NPU 0 显存
                     data = torch.load(f_path, map_location='cpu')
-                    # 修正变量名为 self.tp_size 和 self.tp_rank
+                    
                     self.tucker_experts[str(g_id)] = nn.ModuleDict({
                         'gate': DistributedTuckerLinear(data['gate_proj'], "gate_up", self.tp_size, self.tp_rank),
                         'up':   DistributedTuckerLinear(data['up_proj'],   "gate_up", self.tp_size, self.tp_rank),
                         'down': DistributedTuckerLinear(data['down_proj'], "down",    self.tp_size, self.tp_rank),
                     })
-                    del data
-                    if self.tp_rank == 0:
-                        print(f"[TUCKER] Layer {self.layer_idx} Group {g_id} 加载成功")
+                    del data # 立即释放内存
                 else:
-                    if self.tp_rank == 0:
-                        print(f"[TUCKER] 警告: 找不到文件 {f_path}")}")
+                    print(f"[TUCKER Rank {self.tp_rank}] 警告: 文件不存在 {f_path}")
+
+            # [修正 4] 加载完成后进行一次全员同步，确保所有人加载完再推理
+            if torch.distributed.is_initialized():
+                torch.distributed.barrier()
 
     def forward_tucker(self, hidden_states, router_logits):
         import torch.nn.functional as F
