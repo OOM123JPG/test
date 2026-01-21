@@ -1,5 +1,5 @@
 # test
-
+```
 from vllm.distributed import (get_tensor_model_parallel_rank, 
                               get_tensor_model_parallel_world_size,
                               tensor_model_parallel_all_reduce)
@@ -63,5 +63,5 @@ class DistributedTuckerLinear(nn.Module):
             mid = tensor_model_parallel_all_reduce(mid)
             mid_shard = mid[:, tp_rank * r_i_shard : (tp_rank + 1) * r_i_shard]
             return torch.matmul(mid_shard, self.U_I.T)
-
+```
 torchrun --nproc_per_node=4            
