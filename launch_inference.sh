@@ -36,19 +36,27 @@ torchrun --nnodes=2 --node_rank=1 --nproc_per_node=8 --master_addr=192.168.1.10 
 
 
 ###########################################
-第一步：在机器 0 的终端执行（假设 IP 为 192.168.1.10）：
+# 清理之前的残余进程
+pkill -9 python
 
-Bash
-export HCCL_IF_IP=192.168.1.10
+# 指定 NPU 通信使用的网卡 IP
+export HCCL_IF_IP=7.242.104.207
+# 允许动态组网
+export HCCL_WHITELIST_DISABLE=1
+# 某些环境下需要指定具体的网卡名，例如 eth0 或 enp... (用 ifconfig 查看)
+# export HCCL_SOCKET_IFNAME=eth0 
+
 torchrun --nnodes=2 --node_rank=0 --nproc_per_node=8 \
---master_addr=192.168.1.10 --master_port=29500 \
+--master_addr=7.242.104.207 --master_port=29500 \
 src/test_hccl.py
-(此时终端会进入等待状态，因为它在等另外 8 个进程加入)
 
-第二步：在机器 1 的终端执行（假设 IP 为 192.168.1.11）：
 
-Bash
-export HCCL_IF_IP=192.168.1.11
+
+pkill -9 python
+
+export HCCL_IF_IP=7.242.109.127
+export HCCL_WHITELIST_DISABLE=1
+
 torchrun --nnodes=2 --node_rank=1 --nproc_per_node=8 \
---master_addr=192.168.1.10 --master_port=29500 \
+--master_addr=7.242.104.207 --master_port=29500 \
 src/test_hccl.py
