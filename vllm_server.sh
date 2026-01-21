@@ -48,3 +48,9 @@ export HCCL_CONNECT_TIMEOUT=300
 
 # 第三步：加入 Ray 集群
 ray start --address 7.242.104.207:6379 --node-ip-address 7.242.109.127
+
+顺序：先在 Node 0 启动 Ray Head，然后在 Node 1 启动 Ray Worker，最后在 Node 0 运行 Python 服务指令。
+
+验证：在 Node 0 启动 Python 前，运行 ray status。如果看到 Logical Resources: 16/16 NPU，说明通信已彻底打通。
+
+日志：如果启动过程中显存卡在 115MB，请观察 Node 0 的控制台输出，你应该能看到你修改的 [TUCKER] Rank X 正在读取... 的分片加载日志。
