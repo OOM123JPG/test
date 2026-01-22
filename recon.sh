@@ -1,6 +1,7 @@
 export ASCEND_RT_VISIBLE_DEVICES=8,9,10,11,12,13,14,15
 export PYTORCH_NPU_ALLOC_CONF=max_split_size_mb:128
 export HCCL_BUFFSIZE=120
+export HCCL_IF_IP="10.120.72.45"
 
 python /home/GZGKD001/tmp/yanhong/tdmoe_deepseek/distribution/reconstruct_inference.py \
     --model_path /home/GZGKD001/tmp/models/DeepSeek-V3-bf16 \
