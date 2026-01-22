@@ -11,10 +11,11 @@ import time
 import uuid
 import asyncio
 from datetime import timedelta
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Union
 from fastapi import FastAPI
 from pydantic import BaseModel
 import uvicorn
+import torch.nn.functional as F
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.cache_utils import DynamicCache
@@ -22,11 +23,15 @@ from transformers.cache_utils import DynamicCache
 # ==========================================
 # 0. 日志配置
 # ==========================================
-logging.basicConfig(level=logging.INFO, format='%(asctime)s.%(msecs)03d - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO, 
+    format='%(asctime)s.%(msecs)03d - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
 logger = logging.getLogger(__name__)
 
 # ==========================================
-# 1. Tucker 组件
+# 1. Tucker 组件 (保持不变)
 # ==========================================
 class TuckerGroupLinear(nn.Module):
     def __init__(self, core, factors):
@@ -81,7 +86,7 @@ def apply_sampling(logits, temperature, top_p, repetition_penalty, batch_ids):
     return logits
 
 # ==========================================
-# 3. 分布式引擎
+# 3. 分布式引擎 (全功能版)
 # ==========================================
 class DistributedInferenceEngine:
     def __init__(self, args):
@@ -100,7 +105,6 @@ class DistributedInferenceEngine:
         self.tokenizer.pad_token = self.tokenizer.eos_token
         self.tokenizer.padding_side = "left"
 
-        # 加载 DeepSeek-V3
         full_model = AutoModelForCausalLM.from_pretrained(self.args.model_path, torch_dtype=torch.bfloat16, trust_remote_code=True, device_map={"": "cpu"})
         
         mid = 29
@@ -122,8 +126,6 @@ class DistributedInferenceEngine:
         for i in range(num_layers):
             real_idx = self.start_idx + i
             layer = self.model.model.layers[i]
-            
-            # 只有 MoE 层（DeepseekV3MoE）才具有 experts 属性
             if hasattr(layer.mlp, "experts") and real_idx in self.args.layers:
                 expert_list = layer.mlp.experts
                 for g_idx in range(8):
@@ -136,17 +138,10 @@ class DistributedInferenceEngine:
                                 g_exp = g_idx * 32 + l_idx
                                 if g_exp < len(expert_list):
                                     setattr(expert_list[g_exp], proj, TuckerExpertWrapper(gm, l_idx))
-            
-            # 顺序分配到 8 张 NPU
             layer.to(f"npu:{i % 8}")
-            
-        if self.args.node_rank == 0:
-            self.model.model.embed_tokens.to("npu:0")
-        else:
-            self.model.model.norm.to("npu:7")
-            self.model.lm_head.to("npu:7")
-        gc.collect()
-        torch.npu.empty_cache()
+        if self.args.node_rank == 0: self.model.model.embed_tokens.to("npu:0")
+        else: self.model.model.norm.to("npu:7"); self.model.lm_head.to("npu:7")
+        gc.collect(); torch.npu.empty_cache()
 
     async def run_loop(self):
         while self.is_running:
@@ -155,16 +150,25 @@ class DistributedInferenceEngine:
                 try:
                     req = await asyncio.wait_for(self.req_queue.get(), timeout=0.001)
                     active_reqs.append(req)
-                    while not self.req_queue.empty() and len(active_reqs) < 4:
+                    while not self.req_queue.empty() and len(active_reqs) < 8:
                         active_reqs.append(self.req_queue.get_nowait())
                 except asyncio.TimeoutError:
                     dist.broadcast(torch.tensor([0], dtype=torch.long, device="npu:0"), src=0)
                     continue
-                dist.broadcast(torch.tensor([len(active_reqs)], dtype=torch.long, device="npu:0"), src=0)
+
+                batch_size = len(active_reqs)
+                # --- 打印装箱日志 ---
+                logger.info(f"Packing {batch_size} requests. Type: {active_reqs[0]['type']}. Queue size: {self.req_queue.qsize()}")
+                
+                dist.broadcast(torch.tensor([batch_size], dtype=torch.long, device="npu:0"), src=0)
+                # 任务同步参数
                 p_args = active_reqs[0]
-                params = torch.tensor([p_args['max_tokens'], p_args['temp'], p_args['top_p'], p_args['rep_p']], device="npu:0")
+                task_type_code = 1 if p_args['type'] == 'loglikelihood' else 0
+                params = torch.tensor([task_type_code, p_args['max_tokens'], p_args['temp'], p_args['top_p'], p_args.get('cont_len', 0)], device="npu:0", dtype=torch.float32)
                 dist.broadcast(params, src=0)
-                inputs = self.tokenizer([r['prompt'] for r in active_reqs], return_tensors="pt", padding=True).to("npu:0")
+
+                prompts = [r['prompt'] for r in active_reqs]
+                inputs = self.tokenizer(prompts, return_tensors="pt", padding=True).to("npu:0")
                 dist.broadcast(torch.tensor([inputs.input_ids.shape[1]], dtype=torch.long, device="npu:0"), src=0)
                 dist.broadcast(inputs.input_ids, src=0)
                 input_ids = inputs.input_ids
@@ -173,19 +177,56 @@ class DistributedInferenceEngine:
                 dist.broadcast(signal, src=0)
                 if signal.item() == 0: continue
                 batch_size = int(signal.item())
-                params = torch.zeros([4], device="npu:0")
+                params = torch.zeros([5], device="npu:0")
                 dist.broadcast(params, src=0)
-                p_args = {'max_tokens': int(params[0].item()), 'temp': params[1].item(), 'top_p': params[2].item(), 'rep_p': params[3].item()}
+                task_type_code = int(params[0].item())
+                p_args = {'max_tokens': int(params[1].item()), 'temp': params[2].item(), 'top_p': params[3].item(), 'cont_len': int(params[4].item())}
                 seq_len_t = torch.zeros([1], dtype=torch.long, device="npu:0")
                 dist.broadcast(seq_len_t, src=0)
                 input_ids = torch.zeros((batch_size, int(seq_len_t.item())), dtype=torch.long, device="npu:0")
                 dist.broadcast(input_ids, src=0)
 
-            results = self._execute_inference_sync(input_ids, len(input_ids), p_args)
+            # 分流执行
+            if task_type_code == 1:
+                results = self._execute_loglikelihood_sync(input_ids, batch_size, p_args)
+            else:
+                results = self._execute_inference_sync(input_ids, batch_size, p_args)
+            
             if self.args.node_rank == 0:
                 for i, req in enumerate(active_reqs):
                     rid = req['id']; self.results[rid] = results[i]
                     if rid in self.events: self.events[rid].set()
+
+    def _execute_loglikelihood_sync(self, input_ids, batch_size, p_args):
+        cont_len = p_args['cont_len']
+        with torch.no_grad():
+            curr_input_ids = input_ids.to("npu:0")
+            q_len = curr_input_ids.shape[1]
+            mask = self._prepare_mask(curr_input_ids, batch_size)
+
+            if self.args.node_rank == 0:
+                h = self.model.model.embed_tokens(curr_input_ids)
+                for layer in self.model.model.layers:
+                    dev = next(layer.parameters()).device
+                    h = layer(h.to(dev), attention_mask=mask.to(dev), use_cache=False)[0]
+                dist.send(tensor=h.to("npu:0").to(torch.bfloat16).contiguous(), dst=1)
+                logprobs_result = torch.zeros(batch_size, device="npu:0", dtype=torch.float32)
+                dist.recv(tensor=logprobs_result, src=1)
+                return logprobs_result.tolist()
+            else:
+                h_recv = torch.zeros((batch_size, q_len, self.model.config.hidden_size), dtype=torch.bfloat16, device="npu:0")
+                dist.recv(tensor=h_recv, src=0)
+                h = h_recv
+                for layer in self.model.model.layers:
+                    dev = next(layer.parameters()).device
+                    h = layer(h.to(dev), attention_mask=mask.to(dev), use_cache=False)[0]
+                logits = self.model.lm_head(self.model.model.norm(h.to("npu:7"))) # [B, T, V]
+                logprobs = F.log_softmax(logits, dim=-1)
+                target_ids = input_ids[:, 1:].unsqueeze(-1).to("npu:7")
+                relevant_logprobs = logprobs[:, :-1, :].gather(-1, target_ids).squeeze(-1)
+                batch_res = [relevant_logprobs[i, -cont_len:].sum().item() for i in range(batch_size)]
+                dist.send(tensor=torch.tensor(batch_res, device="npu:0", dtype=torch.float32), dst=0)
+                return batch_res
 
     def _execute_inference_sync(self, input_ids, batch_size, p_args):
         batch_ids = input_ids.tolist()
@@ -195,7 +236,6 @@ class DistributedInferenceEngine:
         position_ids = current_mask.cumsum(-1) - 1
         position_ids.masked_fill_(current_mask == 0, 0)
         finished, max_gen = [False] * batch_size, int(p_args['max_tokens'])
-
         with torch.no_grad():
             for step in range(max_gen):
                 total_len, q_len = len(batch_ids[0]), curr_input_ids.shape[1]
@@ -204,11 +244,9 @@ class DistributedInferenceEngine:
                     mask = causal_mask.view(1, 1, q_len, q_len) + (1.0 - current_mask.view(batch_size, 1, 1, q_len).to(torch.bfloat16)) * -10000.0
                 else:
                     mask = (1.0 - current_mask.view(batch_size, 1, 1, total_len).to(torch.bfloat16)) * -10000.0
-
                 if self.args.node_rank == 0:
                     h = self.model.model.embed_tokens(curr_input_ids)
                     for layer in self.model.model.layers:
-                        # 自动检测当前层所在设备
                         dev = next(layer.parameters()).device
                         h = layer(h.to(dev), attention_mask=mask.to(dev), position_ids=position_ids.to(dev), past_key_value=past_key_values, use_cache=True)[0]
                     dist.send(tensor=h.to("npu:0").to(torch.bfloat16).contiguous(), dst=1)
@@ -222,10 +260,9 @@ class DistributedInferenceEngine:
                         dev = next(layer.parameters()).device
                         h = layer(h.to(dev), attention_mask=mask.to(dev), position_ids=position_ids.to(dev), past_key_value=past_key_values, use_cache=True)[0]
                     logits = self.model.lm_head(self.model.model.norm(h.to("npu:7")))[:, -1, :]
-                    logits = apply_sampling(logits, p_args['temp'], p_args['top_p'], p_args['rep_p'], batch_ids)
+                    logits = apply_sampling(logits, p_args['temp'], p_args['top_p'], 1.1, batch_ids)
                     next_tokens = torch.multinomial(torch.softmax(logits, dim=-1), 1) if p_args['temp'] > 0 else torch.argmax(logits, -1, True)
                     dist.send(tensor=next_tokens.to("npu:0").contiguous(), dst=0)
-
                 nt_list = next_tokens.squeeze(-1).tolist()
                 for i in range(batch_size):
                     if not finished[i]:
@@ -237,27 +274,43 @@ class DistributedInferenceEngine:
                 position_ids = torch.full((batch_size, 1), len(batch_ids[0]) - 1, dtype=torch.long, device="npu:0")
         return [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in batch_ids]
 
+    def _prepare_mask(self, ids, bsz):
+        q_len = ids.shape[1]
+        padding_mask = (ids != self.tokenizer.pad_token_id).long().to("npu:0")
+        causal_mask = torch.triu(torch.full((q_len, q_len), float("-inf"), device="npu:0"), 1)
+        p_mask = padding_mask.view(bsz, 1, 1, q_len)
+        return causal_mask.view(1, 1, q_len, q_len) + (1.0 - p_mask.to(torch.bfloat16)) * -10000.0
+
 # ==========================================
-# 4. API 定义
+# 4. API 路由定义
 # ==========================================
 app = FastAPI()
-class ChatMessage(BaseModel): role: str; content: str
+
+class LoglikelihoodRequest(BaseModel): context: str; continuation: str
+
+@app.post("/v1/loglikelihood")
+async def loglikelihood(request: LoglikelihoodRequest):
+    req_id = str(uuid.uuid4()); event = asyncio.Event(); engine.events[req_id] = event
+    full_prompt = request.context + request.continuation
+    cont_tokens = engine.tokenizer.encode(request.continuation, add_special_tokens=False)
+    await engine.req_queue.put({"type": "loglikelihood", "id": req_id, "prompt": full_prompt, "cont_len": len(cont_tokens), "max_tokens": 1, "temp": 0.0, "top_p": 1.0, "rep_p": 1.0})
+    await event.wait(); res = engine.results.pop(req_id); del engine.events[req_id]
+    return {"logprob": res}
+
 class ChatCompletionRequest(BaseModel):
-    model: str = "deepseek-v3-tucker"
-    messages: List[ChatMessage]
-    max_tokens: int = 128
-    temperature: float = 0.7
-    top_p: float = 0.9
-    repetition_penalty: float = 1.1
+    model: str = "deepseek-v3-tucker"; messages: List[Dict]
+    max_tokens: int = 128; temperature: float = 0.7; top_p: float = 0.9
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest):
-    req_id = str(uuid.uuid4()); event = asyncio.Event()
-    engine.events[req_id] = event
-    await engine.req_queue.put({"id": req_id, "prompt": request.messages[-1].content, "max_tokens": request.max_tokens, "temp": request.temperature, "top_p": request.top_p, "rep_p": request.repetition_penalty})
+    req_id = str(uuid.uuid4()); event = asyncio.Event(); engine.events[req_id] = event
+    await engine.req_queue.put({"type": "chat", "id": req_id, "prompt": request.messages[-1]["content"], "max_tokens": request.max_tokens, "temp": request.temperature, "top_p": request.top_p, "rep_p": 1.1})
     await event.wait(); content = engine.results.pop(req_id); del engine.events[req_id]
-    return {"id": req_id, "object": "chat.completion", "choices": [{"message": {"role": "assistant", "content": content}}]}
+    return {"id": req_id, "choices": [{"message": {"role": "assistant", "content": content}}]}
 
+# ==========================================
+# 5. 启动入口
+# ==========================================
 engine = None
 def main():
     parser = argparse.ArgumentParser()
@@ -278,13 +331,4 @@ def main():
         uvicorn.run(app, host="0.0.0.0", port=args.port)
     else: asyncio.run(engine.run_loop())
 
-if __name__ == "__main__": 
-    main()
-
-
-python3 /home/GZGKD001/tmp/yanhong/tdmoe_deepseek/src/api_inference.py \
-    --model_path /home/GZGKD001/tmp/models/DeepSeek-V3-bf16 \
-    --whitening_dir /home/GZGKD001/tmp/yanhong/tdmoe_deepseek/output/decompostion/wikitext2_n128 \
-    --node_rank 0 \
-    --master_addr 10.120.72.45 \
-    --port 8888 \
+if __name__ == "__main__": main()
