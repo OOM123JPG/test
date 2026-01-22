@@ -26,7 +26,7 @@ def test_dist():
 if __name__ == "__main__":
     test_dist()
 
-
+# export HCCL_IF_IP=$LOCAL_IP
 # export MASTER_ADDR=10.120.72.45
 # export MASTER_PORT=29506
 # export NODE_RANK=0
