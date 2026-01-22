@@ -52,11 +52,10 @@ class TuckerExpertWrapper(nn.Module):
         return self.group_module(x, indices)
 
 # ==========================================
-# 2. 采样逻辑
+# 2. 采样逻辑实现
 # ==========================================
 
 def apply_sampling(logits, temperature, top_p, repetition_penalty, batch_ids):
-    # 1. Repetition Penalty
     if repetition_penalty != 1.0:
         for i in range(logits.shape[0]):
             for token_id in set(batch_ids[i]):
@@ -65,11 +64,9 @@ def apply_sampling(logits, temperature, top_p, repetition_penalty, batch_ids):
                 else:
                     logits[i, token_id] *= repetition_penalty
 
-    # 2. Temperature
     if temperature > 0:
         logits = logits / temperature
     
-    # 3. Top-P (Nucleus Sampling)
     if top_p < 1.0:
         sorted_logits, sorted_indices = torch.sort(logits, descending=True)
         cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
@@ -83,7 +80,7 @@ def apply_sampling(logits, temperature, top_p, repetition_penalty, batch_ids):
     return logits
 
 # ==========================================
-# 3. 初始化与分发
+# 3. 核心功能函数 (增加日志打印)
 # ==========================================
 
 def init_resources(model_path):
@@ -115,42 +112,59 @@ def parallel_tucker_surgery(model, start_idx, args):
                         setattr(layer.mlp.experts[g_exp], proj, TuckerExpertWrapper(gm, l_idx))
     
     layers = [(start_idx + i, l) for i, l in enumerate(model.model.layers)]
+    logging.info(f"==> Node {args.node_rank}: 启动并行装箱手术...")
     with ThreadPoolExecutor(max_workers=8) as ex:
         list(tqdm(ex.map(process_layer, layers), total=len(layers), desc="Surgery"))
 
 def distribute_logic(model, start_idx, args):
-    RESERVED = 8.0
+    """ 恢复显存分发日志打印 """
+    RESERVED, main_npu = 8.0, "npu:0"
     if args.node_rank == 0:
-        model.model.embed_tokens.to("npu:0")
-        if hasattr(model.model, "rotary_emb"): model.model.rotary_emb.to("npu:0")
+        model.model.embed_tokens.to(main_npu)
+        if hasattr(model.model, "rotary_emb"): model.model.rotary_emb.to(main_npu)
     
-    curr_card = 0
+    curr_card, last_active = 0, main_npu
+    logging.info("-" * 105)
+    logging.info(f"{'Layer':<6} | {'Target':<8} | {'Type':<8} | {'Est. Usage(GB)':<15} | {'Status':<8}")
+    logging.info("-" * 105)
+
     for idx, layer in enumerate(model.model.layers):
         real_idx = start_idx + idx
         l_type = "Tucker" if real_idx in args.layers else "Normal"
         req = 22.0 if l_type == "Normal" else 5.5
         success = False
+        
         while curr_card < 8:
             target = f"npu:{curr_card}"
-            if (torch.npu.mem_get_info(target)[0] / (1024**3)) > (req + RESERVED):
+            # 检查可用显存
+            free_mem = torch.npu.mem_get_info(target)[0] / (1024**3)
+            if free_mem > (req + RESERVED):
                 try:
                     layer.to(target)
-                    success = True
+                    torch.npu.empty_cache()
+                    logging.info(f"L{real_idx:02d}    | {target:<8} | {l_type:<8} | {req:>14.2f} | SUCCESS")
+                    last_active, success = target, True
                     break
-                except:
+                except Exception:
                     curr_card += 1
             else:
                 curr_card += 1
-        if not success: layer.to("cpu")
+        
+        if not success:
+            layer.to("cpu")
+            logging.warning(f"L{real_idx:02d}    | {'cpu':<8} | {l_type:<8} | {'-':>14} | OFFLOAD")
 
+    # 处理末尾组件
     if args.node_rank == 1:
-        # 确保最后几层在最后活跃的卡上
-        last_npu = f"npu:{curr_card if curr_card < 8 else 0}"
-        model.model.norm.to(last_npu)
-        if hasattr(model, "lm_head"): model.lm_head.to(last_npu)
+        model.model.norm.to(last_active)
+        if hasattr(model, "lm_head"): model.lm_head.to(last_active)
+        logging.info(f"Head/Norm assigned to {last_active}")
+    
+    logging.info("-" * 105)
+    return last_active
 
 # ==========================================
-# 4. 推理主循环
+# 4. 推理逻辑
 # ==========================================
 
 def run_no_cache_distributed(model, tokenizer, args, prompts):
@@ -163,6 +177,8 @@ def run_no_cache_distributed(model, tokenizer, args, prompts):
             inputs = tokenizer(prompts, return_tensors="pt", padding=True)
             batch_ids = inputs.input_ids.tolist()
             
+            logging.info(f"==> [Node {args.node_rank}] 进入推理循环...")
+            
             for step in range(args.max_new_tokens):
                 curr_ids_tensor = torch.tensor(batch_ids, dtype=torch.long)
                 seq_len = curr_ids_tensor.shape[1]
@@ -170,6 +186,7 @@ def run_no_cache_distributed(model, tokenizer, args, prompts):
                 mask = torch.triu(torch.full((seq_len, seq_len), float("-inf")), 1).view(1, 1, seq_len, seq_len).expand(batch_size, 1, -1, -1).to(torch.bfloat16)
 
                 if args.node_rank == 0:
+                    # Node 0 流程
                     h = model.model.embed_tokens(curr_ids_tensor.to("npu:0"))
                     for layer in model.model.layers:
                         dev = next(layer.parameters()).device
@@ -179,12 +196,12 @@ def run_no_cache_distributed(model, tokenizer, args, prompts):
                     new_ids_dev = torch.zeros((batch_size, 1), dtype=torch.long, device="npu:0")
                     dist.recv(tensor=new_ids_dev, src=1)
                     
-                    for i in range(batch_size): 
-                        batch_ids[i].append(new_ids_dev[i].item())
+                    for i in range(batch_size): batch_ids[i].append(new_ids_dev[i].item())
                     if args.stream:
                         print(tokenizer.decode([batch_ids[0][-1]]), end="", flush=True)
 
                 else:
+                    # Node 1 流程
                     h_recv = torch.zeros((batch_size, seq_len, config.hidden_size), dtype=torch.bfloat16, device="npu:0")
                     dist.recv(tensor=h_recv, src=0)
                     h = h_recv
@@ -207,12 +224,15 @@ def run_no_cache_distributed(model, tokenizer, args, prompts):
                 if all(ids[-1] == tokenizer.eos_token_id for ids in batch_ids): break
 
             if args.node_rank == 0:
-                print(f"\n\n推理完成 | 耗时: {time.time()-total_start_t:.2f}s")
+                print(f"\n\n推理汇总:\n" + "="*50)
+                for i, res in enumerate(batch_ids):
+                    print(f"[{i+1}] {tokenizer.decode(res, skip_special_tokens=True)}\n")
+                print(f"总耗时: {time.time()-total_start_t:.2f}s")
 
     except Exception: traceback.print_exc()
 
 # ==========================================
-# 5. 执行入口
+# 5. 主程序
 # ==========================================
 
 def get_args():
@@ -233,14 +253,15 @@ def get_args():
 def main():
     args = get_args()
     
-    # 环境变量：稳定性增强
+    # 环境变量与稳定性设置
     os.environ['MASTER_ADDR'] = args.master_addr
     os.environ['MASTER_PORT'] = '29506'
-    os.environ['HCCL_CONNECT_TIMEOUT'] = '7200' # 连接超时 2小时
-    os.environ['HCCL_EXEC_TIMEOUT'] = '7200'    # 执行超时 2小时
+    os.environ['HCCL_CONNECT_TIMEOUT'] = '7200'
+    os.environ['HCCL_EXEC_TIMEOUT'] = '7200'
     os.environ['HCCL_TCP_KEEP_ALIVE_ENABLE'] = '1'
-    
-    # 初始化分布式环境，增加 timeout 容错
+    os.environ['PYTORCH_NPU_ALLOC_CONF'] = 'max_split_size_mb:128'
+
+    # 分布式初始化
     dist.init_process_group(
         backend='hccl', 
         rank=args.node_rank, 
@@ -251,7 +272,7 @@ def main():
 
     tokenizer, model = init_resources(args.model_path)
     
-    # 流水线切分逻辑
+    # 节点任务切分
     mid = 27
     all_l = model.model.layers
     if args.node_rank == 0:
@@ -261,24 +282,23 @@ def main():
     del all_l
     gc.collect()
 
-    # 执行 Tucker 手术
+    # 1. 并行手术
     parallel_tucker_surgery(model, start, args)
-    # 显存分发
+    
+    # 2. 显存分发 (带详细日志打印)
     distribute_logic(model, start, args)
 
-    # --- 关键对齐点 ---
-    logging.info(f"Node {args.node_rank} 准备就绪，等待同步...")
-    dist.barrier() # 两台机器必须都运行到这里，才会开始推理
-    logging.info("同步完成，启动推理流水线。")
+    # 3. 跨机同步对齐
+    logging.info(f"Node {args.node_rank} 准备就绪，等待对端...")
+    dist.barrier()
+    logging.info("所有节点同步成功，进入推理。")
 
-    prompts = ["请介绍一下你自己。"]
+    # 4. 推理
+    prompts = ["什么是人工智能？"]
     run_no_cache_distributed(model, tokenizer, args, prompts)
 
 if __name__ == "__main__":
     main()
-
-
-
 
 
 # import os
