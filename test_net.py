@@ -25,3 +25,17 @@ def test_dist():
 
 if __name__ == "__main__":
     test_dist()
+
+
+# export MASTER_ADDR=10.120.72.45
+# export MASTER_PORT=29506
+# export NODE_RANK=0
+# export HCCL_IF_IP=10.120.72.45
+# python3 test_net.py
+
+
+# export MASTER_ADDR=10.120.72.45
+# export MASTER_PORT=29506
+# export NODE_RANK=1
+# export HCCL_IF_IP=10.120.xx.xx # Node 1 自己的 IP
+# python3 test_net.py
