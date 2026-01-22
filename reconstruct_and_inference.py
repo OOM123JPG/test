@@ -240,139 +240,252 @@ def run_no_cache_distributed(model, tokenizer, args, prompts):
 
 from transformers.cache_utils import DynamicCache
 
-from transformers.cache_utils import DynamicCache
+# def run_with_kv_cache_distributed(model, tokenizer, args, prompts):
+#     config = model.config
+#     batch_size = len(prompts)
+    
+#     # 1. 初始化分布式 KV Cache 对象
+#     # 每个节点只会在自己持有的层索引处（如 Node 1 负责 29-61 层）写入缓存
+#     past_key_values = DynamicCache()
+    
+#     # 编码 Prompt
+#     inputs = tokenizer(prompts, return_tensors="pt", padding=True)
+#     batch_ids = inputs.input_ids.tolist()
+    
+#     # 初始输入（Prefill 阶段是整个 Prompt）
+#     curr_input_ids = inputs.input_ids.to("npu:0")
+#     # 初始位置编码: 0, 1, 2, ..., seq_len-1
+#     position_ids = torch.arange(curr_input_ids.shape[1]).unsqueeze(0).expand(batch_size, -1).to("npu:0")
+    
+#     total_start_t = time.time()
 
+#     try:
+#         with torch.no_grad():
+#             for step in range(args.max_new_tokens):
+#                 is_prefill = (step == 0)
+#                 # 核心修复：在这里定义 total_len，确保 Node 0 和 Node 1 都能访问到
+#                 total_len = len(batch_ids[0])
+#                 seq_len = curr_input_ids.shape[1]
+
+#                 # 2. 准备 Attention Mask
+#                 if is_prefill:
+#                     # Prefill 阶段: 标准因果三角掩码 (bs, 1, q_len, kv_len)
+#                     mask = torch.triu(torch.full((seq_len, seq_len), float("-inf")), 1)
+#                     mask = mask.view(1, 1, seq_len, seq_len).expand(batch_size, 1, -1, -1)
+#                 else:
+#                     # Decoding 阶段: 新 Token 关注过去所有 Token
+#                     # 此时 total_len 是包含已生成的 token 的总长度
+#                     mask = torch.zeros((batch_size, 1, 1, total_len))
+                
+#                 mask = mask.to(torch.bfloat16).to("npu:0")
+
+#                 if args.node_rank == 0:
+#                     # ================= Node 0 计算 (Layer 0 - 28) =================
+#                     h = model.model.embed_tokens(curr_input_ids)
+#                     for layer in model.model.layers:
+#                         dev = next(layer.parameters()).device
+#                         # 传入 past_key_value，层内部会自动根据其全局 .layer_idx 存储 KV
+#                         layer_outputs = layer(
+#                             h.to(dev), 
+#                             attention_mask=mask.to(dev), 
+#                             position_ids=position_ids.to(dev), 
+#                             past_key_value=past_key_values,
+#                             use_cache=True
+#                         )
+#                         h = layer_outputs[0]
+                    
+#                     # 发送中间 Hidden States 给 Node 1
+#                     dist.send(tensor=h.to("npu:0").to(torch.bfloat16).contiguous(), dst=1)
+                    
+#                     # 接收 Node 1 采样出的新 Token ID
+#                     new_ids_dev = torch.zeros((batch_size, 1), dtype=torch.long, device="npu:0")
+#                     dist.recv(tensor=new_ids_dev, src=1)
+                    
+#                     # 更新本地序列记录
+#                     next_token_list = new_ids_dev.cpu().numpy().tolist()
+#                     for i in range(batch_size):
+#                         batch_ids[i].append(next_token_list[i][0])
+                    
+#                     # 打印流式输出
+#                     if args.stream:
+#                         print(tokenizer.decode([batch_ids[0][-1]]), end="", flush=True)
+
+#                     # 准备下一轮 Decoding 的输入
+#                     curr_input_ids = new_ids_dev
+#                     # 下一轮的位置 ID 就是当前更新后的总长度 - 1
+#                     position_ids = torch.full((batch_size, 1), len(batch_ids[0]) - 1, dtype=torch.long, device="npu:0")
+
+#                 else:
+#                     # ================= Node 1 计算 (Layer 29 - 61) =================
+#                     h_recv = torch.zeros((batch_size, seq_len, config.hidden_size), 
+#                                        dtype=torch.bfloat16, device="npu:0")
+#                     dist.recv(tensor=h_recv, src=0)
+                    
+#                     h = h_recv
+#                     for layer in model.model.layers:
+#                         dev = next(layer.parameters()).device
+#                         layer_outputs = layer(
+#                             h.to(dev), 
+#                             attention_mask=mask.to(dev), 
+#                             position_ids=position_ids.to(dev), 
+#                             past_key_value=past_key_values,
+#                             use_cache=True
+#                         )
+#                         h = layer_outputs[0]
+                    
+#                     # Node 1 负责最后的 Norm、Head 和采样
+#                     head_dev = next(model.lm_head.parameters()).device
+#                     logits = model.lm_head(model.model.norm(h.to(head_dev)))[:, -1, :]
+                    
+#                     # 采样逻辑
+#                     if args.do_sample:
+#                         logits = apply_sampling(logits, args.temperature, args.top_p, args.repetition_penalty, batch_ids)
+#                         next_tokens = torch.multinomial(torch.softmax(logits, dim=-1), num_samples=1)
+#                     else:
+#                         next_tokens = torch.argmax(logits, dim=-1, keepdim=True)
+                    
+#                     # 将采样结果发送回 Node 0
+#                     dist.send(tensor=next_tokens.to("npu:0").contiguous(), dst=0)
+                    
+#                     # Node 1 同步更新 batch_ids 以确保采样逻辑一致
+#                     next_token_list = next_tokens.cpu().numpy().tolist()
+#                     for i in range(batch_size):
+#                         batch_ids[i].append(next_token_list[i][0])
+
+#                     # 准备下一轮输入
+#                     curr_input_ids = next_tokens.to("npu:0")
+#                     position_ids = torch.full((batch_size, 1), len(batch_ids[0]) - 1, dtype=torch.long, device="npu:0")
+
+#                 # 终止符检测
+#                 if all(ids[-1] == tokenizer.eos_token_id for ids in batch_ids):
+#                     break
+            
+#             # 推理结束汇总
+#             if args.node_rank == 0:
+#                 print(f"\n\n推理汇总:\n" + "="*50)
+#                 for i, res in enumerate(batch_ids):
+#                     print(f"[{i+1}] {tokenizer.decode(res, skip_special_tokens=True)}\n")
+#                 print(f"总耗时: {time.time()-total_start_t:.2f}s")
+
+#     except Exception:
+#         traceback.print_exc()
+        
 def run_with_kv_cache_distributed(model, tokenizer, args, prompts):
     config = model.config
     batch_size = len(prompts)
     
-    # 1. 初始化分布式 KV Cache 对象
-    # 每个节点只会在自己持有的层索引处（如 Node 1 负责 29-61 层）写入缓存
-    past_key_values = DynamicCache()
-    
-    # 编码 Prompt
+    # 1. 强制设置左填充 (Left Padding)，这对生成任务至关重要
+    # 确保所有序列的最后一个有效 token 都在同一列对齐
+    tokenizer.padding_side = "left"
     inputs = tokenizer(prompts, return_tensors="pt", padding=True)
+    
+    # 记录每个序列的原始 Mask，后续动态更新
+    # 形状: (batch_size, seq_len)
+    current_padding_mask = inputs.attention_mask.to("npu:0") 
     batch_ids = inputs.input_ids.tolist()
     
-    # 初始输入（Prefill 阶段是整个 Prompt）
+    past_key_values = DynamicCache()
     curr_input_ids = inputs.input_ids.to("npu:0")
-    # 初始位置编码: 0, 1, 2, ..., seq_len-1
-    position_ids = torch.arange(curr_input_ids.shape[1]).unsqueeze(0).expand(batch_size, -1).to("npu:0")
     
+    # 生成初始 Position IDs，考虑到 Left Padding，需要减去 padding 的数量
+    # 确保第一个有效 token 的位置从 0 或正确偏移开始
+    position_ids = current_padding_mask.long().cumsum(-1) - 1
+    position_ids.masked_fill_(current_padding_mask == 0, 1) # 临时填 1，后续会被 mask 挡住
+    position_ids = position_ids.to("npu:0")
+
     total_start_t = time.time()
 
     try:
         with torch.no_grad():
             for step in range(args.max_new_tokens):
                 is_prefill = (step == 0)
-                # 核心修复：在这里定义 total_len，确保 Node 0 和 Node 1 都能访问到
-                total_len = len(batch_ids[0])
-                seq_len = curr_input_ids.shape[1]
+                total_len = curr_input_ids.shape[1] if is_prefill else len(batch_ids[0])
+                q_len = curr_input_ids.shape[1]
 
-                # 2. 准备 Attention Mask
+                # 2. 核心：构建 4D Attention Mask
+                # 官方代码要求形状: (bsz, 1, q_len, kv_seq_len)
                 if is_prefill:
-                    # Prefill 阶段: 标准因果三角掩码 (bs, 1, q_len, kv_len)
-                    mask = torch.triu(torch.full((seq_len, seq_len), float("-inf")), 1)
-                    mask = mask.view(1, 1, seq_len, seq_len).expand(batch_size, 1, -1, -1)
+                    # Prefill: 结合因果掩码 + Padding 掩码
+                    # 先生成因果三角掩码
+                    causal_mask = torch.triu(torch.full((q_len, q_len), float("-inf"), device="npu:0"), 1)
+                    # 扩展到 4D 并加上 Padding Mask 的影响
+                    # current_padding_mask 为 0 的位置设为 -inf
+                    p_mask = current_padding_mask.view(batch_size, 1, 1, q_len)
+                    mask = causal_mask.view(1, 1, q_len, q_len) + (1.0 - p_mask.to(torch.bfloat16)) * -10000.0
                 else:
-                    # Decoding 阶段: 新 Token 关注过去所有 Token
-                    # 此时 total_len 是包含已生成的 token 的总长度
-                    mask = torch.zeros((batch_size, 1, 1, total_len))
+                    # Decoding: 只需 Padding 掩码（因为是逐个生成，不需要因果三角）
+                    # 此时 KV 长度为 total_len，Q 长度为 1
+                    mask = (1.0 - current_padding_mask.view(batch_size, 1, 1, total_len).to(torch.bfloat16)) * -10000.0
                 
-                mask = mask.to(torch.bfloat16).to("npu:0")
+                mask = mask.to(torch.bfloat16)
 
                 if args.node_rank == 0:
-                    # ================= Node 0 计算 (Layer 0 - 28) =================
+                    # --- Node 0 计算 ---
                     h = model.model.embed_tokens(curr_input_ids)
                     for layer in model.model.layers:
                         dev = next(layer.parameters()).device
-                        # 传入 past_key_value，层内部会自动根据其全局 .layer_idx 存储 KV
-                        layer_outputs = layer(
-                            h.to(dev), 
-                            attention_mask=mask.to(dev), 
-                            position_ids=position_ids.to(dev), 
-                            past_key_value=past_key_values,
-                            use_cache=True
-                        )
-                        h = layer_outputs[0]
+                        h = layer(h.to(dev), attention_mask=mask.to(dev), position_ids=position_ids.to(dev), 
+                                  past_key_value=past_key_values, use_cache=True)[0]
                     
-                    # 发送中间 Hidden States 给 Node 1
                     dist.send(tensor=h.to("npu:0").to(torch.bfloat16).contiguous(), dst=1)
-                    
-                    # 接收 Node 1 采样出的新 Token ID
                     new_ids_dev = torch.zeros((batch_size, 1), dtype=torch.long, device="npu:0")
                     dist.recv(tensor=new_ids_dev, src=1)
                     
-                    # 更新本地序列记录
-                    next_token_list = new_ids_dev.cpu().numpy().tolist()
-                    for i in range(batch_size):
-                        batch_ids[i].append(next_token_list[i][0])
+                    # 更新序列和 Mask
+                    new_tokens = new_ids_dev.cpu().numpy().tolist()
+                    for i in range(batch_size): batch_ids[i].append(new_tokens[i][0])
+                    # 新生成的 token 永远不是 Padding
+                    current_padding_mask = torch.cat([current_padding_mask, torch.ones((batch_size, 1), device="npu:0")], dim=-1)
                     
-                    # 打印流式输出
-                    if args.stream:
-                        print(tokenizer.decode([batch_ids[0][-1]]), end="", flush=True)
-
-                    # 准备下一轮 Decoding 的输入
                     curr_input_ids = new_ids_dev
-                    # 下一轮的位置 ID 就是当前更新后的总长度 - 1
                     position_ids = torch.full((batch_size, 1), len(batch_ids[0]) - 1, dtype=torch.long, device="npu:0")
+                    
+                    if args.stream:
+                        print(f"\rStep {step} 生成中...", end="", flush=True)
 
                 else:
-                    # ================= Node 1 计算 (Layer 29 - 61) =================
-                    h_recv = torch.zeros((batch_size, seq_len, config.hidden_size), 
-                                       dtype=torch.bfloat16, device="npu:0")
+                    # --- Node 1 计算 ---
+                    h_recv = torch.zeros((batch_size, q_len, config.hidden_size), dtype=torch.bfloat16, device="npu:0")
                     dist.recv(tensor=h_recv, src=0)
                     
                     h = h_recv
                     for layer in model.model.layers:
                         dev = next(layer.parameters()).device
-                        layer_outputs = layer(
-                            h.to(dev), 
-                            attention_mask=mask.to(dev), 
-                            position_ids=position_ids.to(dev), 
-                            past_key_value=past_key_values,
-                            use_cache=True
-                        )
-                        h = layer_outputs[0]
+                        h = layer(h.to(dev), attention_mask=mask.to(dev), position_ids=position_ids.to(dev), 
+                                  past_key_value=past_key_values, use_cache=True)[0]
                     
-                    # Node 1 负责最后的 Norm、Head 和采样
                     head_dev = next(model.lm_head.parameters()).device
                     logits = model.lm_head(model.model.norm(h.to(head_dev)))[:, -1, :]
                     
-                    # 采样逻辑
                     if args.do_sample:
                         logits = apply_sampling(logits, args.temperature, args.top_p, args.repetition_penalty, batch_ids)
                         next_tokens = torch.multinomial(torch.softmax(logits, dim=-1), num_samples=1)
                     else:
                         next_tokens = torch.argmax(logits, dim=-1, keepdim=True)
                     
-                    # 将采样结果发送回 Node 0
                     dist.send(tensor=next_tokens.to("npu:0").contiguous(), dst=0)
                     
-                    # Node 1 同步更新 batch_ids 以确保采样逻辑一致
-                    next_token_list = next_tokens.cpu().numpy().tolist()
-                    for i in range(batch_size):
-                        batch_ids[i].append(next_token_list[i][0])
+                    # 同步更新 Node 1 的 Mask 和序列
+                    nt_list = next_tokens.cpu().numpy().tolist()
+                    for i in range(batch_size): batch_ids[i].append(nt_list[i][0])
+                    current_padding_mask = torch.cat([current_padding_mask, torch.ones((batch_size, 1), device="npu:0")], dim=-1)
 
-                    # 准备下一轮输入
                     curr_input_ids = next_tokens.to("npu:0")
                     position_ids = torch.full((batch_size, 1), len(batch_ids[0]) - 1, dtype=torch.long, device="npu:0")
 
-                # 终止符检测
                 if all(ids[-1] == tokenizer.eos_token_id for ids in batch_ids):
                     break
             
-            # 推理结束汇总
             if args.node_rank == 0:
                 print(f"\n\n推理汇总:\n" + "="*50)
                 for i, res in enumerate(batch_ids):
-                    print(f"[{i+1}] {tokenizer.decode(res, skip_special_tokens=True)}\n")
+                    # 跳过 Padding token 进行解码
+                    out = tokenizer.decode(res, skip_special_tokens=True)
+                    print(f"[{i+1}] {out}\n")
                 print(f"总耗时: {time.time()-total_start_t:.2f}s")
-
     except Exception:
         traceback.print_exc()
-        
-        
+                
 # ==========================================
 # 5. 主程序入口
 # ==========================================
@@ -383,7 +496,7 @@ def main():
     parser.add_argument("--layers", type=int, nargs='+', default=list(range(3, 61)))
     parser.add_argument("--node_rank", type=int, default=0)
     parser.add_argument("--master_addr", type=str, default="10.120.72.45")
-    parser.add_argument("--max_new_tokens", type=int, default=128)
+    parser.add_argument("--max_new_tokens", type=int, default=50)
     parser.add_argument("--do_sample", action="store_true")
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top_p", type=float, default=0.9)
@@ -438,13 +551,12 @@ def main():
     dist.barrier()
     logging.info("同步成功，启动推理。")
 
-    prompts = ["什么是人工智能？"]
+    prompts = ["什么是人工智能？","请写一首关于大海的诗。"]
     # run_no_cache_distributed(model, tokenizer, args, prompts)
     run_with_kv_cache_distributed(model, tokenizer, args, prompts)
 
 if __name__ == "__main__":
     main()
-
 # import os
 # import sys
 # import torch
