@@ -280,3 +280,11 @@ def main():
 
 if __name__ == "__main__": 
     main()
+
+
+python3 /home/GZGKD001/tmp/yanhong/tdmoe_deepseek/src/api_inference.py \
+    --model_path /home/GZGKD001/tmp/models/DeepSeek-V3-bf16 \
+    --whitening_dir /home/GZGKD001/tmp/yanhong/tdmoe_deepseek/output/decompostion/wikitext2_n128 \
+    --node_rank 0 \
+    --master_addr 10.120.72.45 \
+    --port 8888 \
