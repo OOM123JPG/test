@@ -61,7 +61,7 @@ class TuckerExpertWrapper(nn.Module):
         return self.group_module(x, indices)
 
 # ==========================================
-# 2. 采样辅助函数
+# 2. 采样辅助
 # ==========================================
 def apply_sampling(logits, temperature, top_p, repetition_penalty, batch_ids):
     if repetition_penalty != 1.0:
@@ -84,7 +84,7 @@ def apply_sampling(logits, temperature, top_p, repetition_penalty, batch_ids):
     return logits
 
 # ==========================================
-# 3. 分布式引擎 (集成脚本版的 pipeline_loading)
+# 3. 分布式全功能引擎 (完美对齐脚本版加载逻辑)
 # ==========================================
 class DistributedInferenceEngine:
     def __init__(self, args):
@@ -95,18 +95,24 @@ class DistributedInferenceEngine:
         self.results = {}
         self.events = {}
         self.is_running = True
+        self.start_idx = 0
 
     def setup(self):
-        dist.init_process_group(backend='hccl', rank=self.args.node_rank, world_size=2, timeout=timedelta(days=36500))
+        # 初始化分布式环境
+        dist.init_process_group(backend='hccl', rank=self.args.node_rank, world_size=2, timeout=timedelta(seconds=7200))
         torch.npu.set_device("npu:0")
+        
+        # 1. 显式加载 Tokenizer 并存入 self
+        logger.info(f"Loading Tokenizer from {self.args.model_path}...")
         self.tokenizer = AutoTokenizer.from_pretrained(self.args.model_path, trust_remote_code=True)
         self.tokenizer.pad_token = self.tokenizer.eos_token
         self.tokenizer.padding_side = "left"
 
-        # 1. 初始加载到 CPU
+        # 2. 初始加载模型到 CPU
+        logger.info("Loading Model to CPU...")
         full_model = AutoModelForCausalLM.from_pretrained(self.args.model_path, torch_dtype=torch.bfloat16, trust_remote_code=True, device_map={"": "cpu"})
         
-        # 2. 物理层切分 (0-28 对 29-61)
+        # 3. 物理层切分 (Node 0: 0-28, Node 1: 29-61)
         mid = 29
         all_l = full_model.model.layers
         if self.args.node_rank == 0:
@@ -117,18 +123,17 @@ class DistributedInferenceEngine:
             self.start_idx = mid
         
         self.model = full_model
-        # 3. 执行脚本版的高效手术与装箱逻辑
+        
+        # 4. 执行多线程手术与顺序显存装箱
         self._pipeline_surgery_and_loading()
         
         dist.barrier()
-        logger.info(f"Node {self.args.node_rank} Ready.")
+        logger.info(f"✅ Node {self.args.node_rank} Ready.")
 
     def _pipeline_surgery_and_loading(self):
-        """完全移植你脚本中的 pipeline_loading_and_surgery 逻辑"""
         num_layers = len(self.model.model.layers)
         RESERVED, main_npu = 6.0, "npu:0"
         
-        # 并行手术生产者
         def surgery_task(idx_in_module, layer):
             real_idx = self.start_idx + idx_in_module
             if hasattr(layer.mlp, "experts") and real_idx in self.args.layers:
@@ -147,7 +152,6 @@ class DistributedInferenceEngine:
         executor = ThreadPoolExecutor(max_workers=8)
         futures = [executor.submit(surgery_task, i, self.model.model.layers[i]) for i in range(num_layers)]
 
-        # 顺序装箱消费者
         curr_card = 0
         last_active = main_npu
         if self.args.node_rank == 0:
@@ -156,9 +160,7 @@ class DistributedInferenceEngine:
         for i in range(num_layers):
             real_idx = self.start_idx + i
             futures[i].result() # 等待手术完成
-            
             layer = self.model.model.layers[i]
-            # 根据是否是 Tucker 层预估显存
             req_gb = 5.5 if real_idx in self.args.layers else 22.0
             
             success = False
@@ -170,18 +172,15 @@ class DistributedInferenceEngine:
                         layer.to(target)
                         torch.npu.empty_cache()
                         last_active, success = target, True
-                        logger.info(f"Layer {real_idx:02d} -> {target} (Est {req_gb}GB) SUCCESS")
+                        logger.info(f"Layer {real_idx:02d} -> {target} SUCCESS")
                         break
                     except: curr_card += 1
                 else: curr_card += 1
-            
-            if not success:
-                logger.warning(f"Layer {real_idx:02d} -> OFFLOAD TO CPU")
+            if not success: logger.warning(f"Layer {real_idx:02d} -> CPU OFFLOAD")
 
         if self.args.node_rank == 1:
             self.model.model.norm.to(last_active)
             self.model.lm_head.to(last_active)
-            
         executor.shutdown(wait=True)
         gc.collect(); torch.npu.empty_cache()
 
@@ -199,14 +198,15 @@ class DistributedInferenceEngine:
                     continue
 
                 batch_size = len(active_reqs)
-                logger.info(f"🚀 Packing {batch_size} requests. Type: {active_reqs[0]['type']}. Queue: {self.req_queue.qsize()}")
-                
+                logger.info(f"🚀 Packing {batch_size} requests. TaskType: {active_reqs[0]['type']}.")
                 dist.broadcast(torch.tensor([batch_size], dtype=torch.long, device="npu:0"), src=0)
+                
                 p_args = active_reqs[0]
                 task_code = 1 if p_args['type'] == 'loglikelihood' else 0
                 params = torch.tensor([task_code, p_args['max_tokens'], p_args['temp'], p_args['top_p'], p_args.get('cont_len', 0)], device="npu:0", dtype=torch.float32)
                 dist.broadcast(params, src=0)
 
+                # 修复 NoneType: 确保 self.tokenizer 已加载
                 inputs = self.tokenizer([r['prompt'] for r in active_reqs], return_tensors="pt", padding=True).to("npu:0")
                 dist.broadcast(torch.tensor([inputs.input_ids.shape[1]], dtype=torch.long, device="npu:0"), src=0)
                 dist.broadcast(inputs.input_ids, src=0)
@@ -218,8 +218,8 @@ class DistributedInferenceEngine:
                 batch_size = int(signal.item())
                 params = torch.zeros([5], device="npu:0")
                 dist.broadcast(params, src=0)
-                task_code = int(params[0].item())
-                p_args = {'max_tokens': int(params[1].item()), 'temp': params[2].item(), 'top_p': params[3].item(), 'cont_len': int(params[4].item())}
+                task_code, p_max, p_temp, p_top, p_cont = params.tolist()
+                p_args = {'max_tokens': int(p_max), 'temp': p_temp, 'top_p': p_top, 'cont_len': int(p_cont)}
                 seq_len_t = torch.zeros([1], dtype=torch.long, device="npu:0")
                 dist.broadcast(seq_len_t, src=0)
                 input_ids = torch.zeros((batch_size, int(seq_len_t.item())), dtype=torch.long, device="npu:0")
@@ -239,6 +239,7 @@ class DistributedInferenceEngine:
             q_len = input_ids.shape[1]
             padding_mask = (input_ids != self.tokenizer.pad_token_id).long().to("npu:0")
             causal_mask = torch.triu(torch.full((q_len, q_len), float("-inf"), device="npu:0"), 1)
+            # 形状修正：(1,1,q,q) + (b,1,1,q)
             mask = causal_mask.view(1, 1, q_len, q_len) + (1.0 - padding_mask.view(batch_size, 1, 1, q_len).to(torch.bfloat16)) * -10000.0
 
             if self.args.node_rank == 0:
@@ -277,7 +278,6 @@ class DistributedInferenceEngine:
                 is_prefill = (step == 0)
                 total_len = curr_input_ids.shape[1] if is_prefill else len(batch_ids[0])
                 q_len = curr_input_ids.shape[1]
-                
                 if is_prefill:
                     causal_mask = torch.triu(torch.full((q_len, q_len), float("-inf"), device="npu:0"), 1)
                     mask = causal_mask.view(1, 1, q_len, q_len) + (1.0 - current_padding_mask.view(batch_size, 1, 1, q_len).to(torch.bfloat16)) * -10000.0
@@ -287,8 +287,7 @@ class DistributedInferenceEngine:
                 if self.args.node_rank == 0:
                     h = self.model.model.embed_tokens(curr_input_ids)
                     for layer in self.model.model.layers:
-                        dev = next(layer.parameters()).device
-                        h = layer(h.to(dev), attention_mask=mask.to(dev), position_ids=position_ids.to(dev), past_key_value=past_key_values, use_cache=True)[0]
+                        h = layer(h.to(next(layer.parameters()).device), attention_mask=mask.to(next(layer.parameters()).device), position_ids=position_ids.to(next(layer.parameters()).device), past_key_value=past_key_values, use_cache=True)[0]
                     dist.send(tensor=h.to("npu:0").to(torch.bfloat16).contiguous(), dst=1)
                     new_ids_dev = torch.zeros((batch_size, 1), dtype=torch.long, device="npu:0")
                     dist.recv(tensor=new_ids_dev, src=1)
@@ -298,8 +297,7 @@ class DistributedInferenceEngine:
                     dist.recv(tensor=h_recv, src=0)
                     h = h_recv
                     for layer in self.model.model.layers:
-                        dev = next(layer.parameters()).device
-                        h = layer(h.to(dev), attention_mask=mask.to(dev), position_ids=position_ids.to(dev), past_key_value=past_key_values, use_cache=True)[0]
+                        h = layer(h.to(next(layer.parameters()).device), attention_mask=mask.to(next(layer.parameters()).device), position_ids=position_ids.to(next(layer.parameters()).device), past_key_value=past_key_values, use_cache=True)[0]
                     logits = self.model.lm_head(self.model.model.norm(h.to(next(self.model.lm_head.parameters()).device)))[:, -1, :]
                     logits = apply_sampling(logits, p_args['temp'], p_args['top_p'], 1.1, batch_ids)
                     next_tokens = torch.multinomial(torch.softmax(logits, dim=-1), 1) if p_args['temp'] > 0 else torch.argmax(logits, -1, True)
@@ -317,7 +315,7 @@ class DistributedInferenceEngine:
         return [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in batch_ids]
 
 # ==========================================
-# 4. API 路由
+# 4. API 路由与逻辑对齐
 # ==========================================
 app = FastAPI()
 class ChatMessage(BaseModel): role: str; content: str
@@ -331,7 +329,8 @@ class CompletionRequest(BaseModel):
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest):
     req_id = str(uuid.uuid4()); event = asyncio.Event(); engine.events[req_id] = event
-    content = request.messages[-1].content
+    last_msg = request.messages[-1]
+    content = last_msg.content if hasattr(last_msg, 'content') else last_msg["content"]
     await engine.req_queue.put({"type": "chat", "id": req_id, "prompt": content, "max_tokens": request.max_tokens, "temp": request.temperature, "top_p": request.top_p})
     await event.wait(); res = engine.results.pop(req_id); del engine.events[req_id]
     return {"id": req_id, "object": "chat.completion", "choices": [{"message": {"role": "assistant", "content": res}, "index": 0, "finish_reason": "stop"}]}
@@ -344,8 +343,8 @@ async def completions(request: CompletionRequest):
     await engine.req_queue.put({"type": "loglikelihood" if is_ll else "chat", "id": req_id, "prompt": p, "max_tokens": request.max_tokens, "temp": request.temperature, "top_p": request.top_p, "cont_len": request.max_tokens})
     await event.wait(); res = engine.results.pop(req_id); del engine.events[req_id]
     if is_ll:
-        return {"id": req_id, "choices": [{"text": "", "index": 0, "logprobs": {"token_logprobs": [res], "tokens": ["<continuation>"], "top_logprobs": [{}]}, "finish_reason": "stop"}]}
-    return {"id": req_id, "choices": [{"text": res, "index": 0, "finish_reason": "stop"}]}
+        return {"id": req_id, "object": "text_completion", "choices": [{"text": "", "index": 0, "logprobs": {"token_logprobs": [res], "tokens": ["<continuation>"], "top_logprobs": [{}]}, "finish_reason": "stop"}]}
+    return {"id": req_id, "object": "text_completion", "choices": [{"text": res, "index": 0, "finish_reason": "stop"}]}
 
 # ==========================================
 # 5. 主入口
@@ -360,19 +359,20 @@ def main():
     parser.add_argument("--port", type=int, default=8888)
     parser.add_argument("--layers", type=int, nargs='+', default=list(range(3, 61)))
     args = parser.parse_args()
+    
     os.environ['MASTER_ADDR'] = args.master_addr; os.environ['MASTER_PORT'] = '29506'
+    os.environ['HCCL_CONNECT_TIMEOUT'] = '7200'; os.environ['HCCL_EXEC_TIMEOUT'] = '7200'
     os.environ['PYTORCH_NPU_ALLOC_CONF'] = 'max_split_size_mb:128'
-    os.environ['HCCL_CONNECT_TIMEOUT'] = '0'
-    os.environ['HCCL_EXEC_TIMEOUT'] = '0'
-    os.environ['HCCL_TCP_KEEP_ALIVE_ENABLE'] = '1'
     
     global engine; engine = DistributedInferenceEngine(args); engine.setup()
+    
     if args.node_rank == 0:
         import threading
         def run_e():
             loop = asyncio.new_event_loop(); asyncio.set_event_loop(loop); loop.run_until_complete(engine.run_loop())
         threading.Thread(target=run_e, daemon=True).start()
         uvicorn.run(app, host="0.0.0.0", port=args.port)
-    else: asyncio.run(engine.run_loop())
+    else:
+        asyncio.run(engine.run_loop())
 
 if __name__ == "__main__": main()
