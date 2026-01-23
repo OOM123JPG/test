@@ -13,6 +13,13 @@ for i in range(8):
     except Exception as e:
         print(f"{device} FAILED: {e}")
         
+import torch
+import os
+
+path = "你的whitening_dir/layer_3_group_0.pt" # 换成你报错那一层的路径
+print("Attempting to load file...")
+data = torch.load(path, map_location='cpu')
+print("Load success. Keys:", data.keys())
 
 # import os
 # import torch
