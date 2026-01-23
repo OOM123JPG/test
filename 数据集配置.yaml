@@ -1,0 +1,11 @@
+
+task: my_offline_task
+dataset_path: json  # 或者是 csv, parquet 等
+dataset_kwargs:
+  data_files:
+    train: /path/to/your/local/data/train.json
+    validation: /path/to/your/local/data/val.json
+    test: /path/to/your/local/data/test.json
+# 如果是文件夹形式
+# dataset_kwargs:
+#   data_dir: /path/to/your/local/dataset_folder/
