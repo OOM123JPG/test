@@ -1,4 +1,4 @@
-curl -X POST http://10.120.72.45:8888/v1/chat/completions \
+curl -X POST http://127.0.0.1:8888/v1/chat/completions \
    -H "Content-Type: application/json" \
    -d '{
      "model": "deepseek-v3-tucker",
@@ -21,3 +21,13 @@ curl http://127.0.0.1:8888/v1/completions \
 	
 	
 	   
+curl http://127.0.0.1:8888/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "deepseek-v3-tucker",
+    "prompt": ["Option A is better.", "Option B is better."],
+    "temperature": 0,
+    "max_tokens": 1,
+    "logprobs": 1,
+    "echo": true
+  }'
