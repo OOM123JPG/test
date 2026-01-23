@@ -146,14 +146,22 @@ if __name__ == "__main__":
 
     # run_api_eval(**CONFIG)
 
-    # --- 运行 1: 通用任务 (0-shot) ---
-    print("\n>>> 开始评估 LMEH 通用任务 (0-shot)")
-    run_api_eval(task_names=general_tasks, num_fewshot=0, **COMMON_CONFIG)
+    eval_groups = [
+        ("LMEH 通用任务 (0-shot)", general_tasks, 0),
+        ("MMLU 任务 (5-shot)", mmlu_tasks, 5),
+        ("C-Eval 任务 (5-shot)", ceval_tasks, 5)
+    ]
 
-    # --- 运行 2: MMLU 任务 (5-shot) ---
-    print("\n>>> 开始评估 MMLU 任务 (5-shot)")
-    run_api_eval(task_names=mmlu_tasks, num_fewshot=5, **COMMON_CONFIG)
+    for group_name, tasks, shot in eval_groups:
+        print(f"\n>>> 准备进入组别评估: {group_name}")
+        try:
+            # 调用函数
+            run_api_eval(task_names=tasks, num_fewshot=shot, **COMMON_CONFIG)
+        except Exception as e:
+            # 如果某一组因为 API 连接、初始化等严重问题挂了，捕获它，继续下一组
+            logger.critical(f"严重错误：评估组 [{group_name}] 整体执行失败，正在尝试跳至下一组。错误详情: {e}")
+            continue
 
-    # --- 运行 3: C-Eval 任务 (5-shot) ---
-    print("\n>>> 开始评估 C-Eval 任务 (5-shot)")
-    run_api_eval(task_names=ceval_tasks, num_fewshot=5, **COMMON_CONFIG)
+    print("\n" + "="*50)
+    print("所有评估流程执行尝试已结束。")
+    print("="*50)
