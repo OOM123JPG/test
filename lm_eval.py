@@ -10,6 +10,48 @@ from lm_eval.models.openai_completions import LocalCompletionsAPI
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# 1. LMEH 通用任务 (通常为 0-shot)
+general_tasks = [
+    "winogrande",
+    "piqa",
+    "arc_easy",
+    "arc_challenge"
+]
+
+# 2. MMLU 任务 (STEM 类别，需要 fewshot=5)
+mmlu_tasks = [
+    "mmlu_task_astronomy",
+    "mmlu_task_college_biology",
+    "mmlu_task_college_chemistry",
+    "mmlu_task_college_computer_science",
+    "mmlu_task_college_mathematics",
+    "mmlu_task_computer_security",
+    "mmlu_task_conceptual_physics",
+    "mmlu_task_electrical_engineering",
+    "mmlu_task_high_school_biology",
+    "mmlu_task_high_school_chemistry",
+    "mmlu_task_high_school_computer_science",
+    "mmlu_task_high_school_physics",
+    "mmlu_task_high_school_statistics",
+    "mmlu_task_machine_learning"
+]
+
+# 3. C-Eval 任务 (需要 fewshot=5)
+ceval_tasks = [
+    "ceval_task_computer_network",
+    "ceval_task_college_programming",
+    "ceval_task_college_physics",
+    "ceval_task_college_chemistry",
+    "ceval_task_discrete_mathematics",
+    "ceval_task_high_school_physics",
+    "ceval_task_high_school_chemistry",
+    "ceval_task_high_school_biology",
+    "ceval_task_middle_school_mathematics",
+    "ceval_task_middle_school_biology",
+    "ceval_task_middle_school_physics",
+    "ceval_task_middle_school_chemistry"
+]
+
 def run_api_eval(
     model_name: str,
     base_url: str,
@@ -102,4 +144,16 @@ if __name__ == "__main__":
         "batch_size": 1,
     }
 
-    run_api_eval(**CONFIG)
+    # run_api_eval(**CONFIG)
+
+    # --- 运行 1: 通用任务 (0-shot) ---
+    print("\n>>> 开始评估 LMEH 通用任务 (0-shot)")
+    run_api_eval(task_names=general_tasks, num_fewshot=0, **COMMON_CONFIG)
+
+    # --- 运行 2: MMLU 任务 (5-shot) ---
+    print("\n>>> 开始评估 MMLU 任务 (5-shot)")
+    run_api_eval(task_names=mmlu_tasks, num_fewshot=5, **COMMON_CONFIG)
+
+    # --- 运行 3: C-Eval 任务 (5-shot) ---
+    print("\n>>> 开始评估 C-Eval 任务 (5-shot)")
+    run_api_eval(task_names=ceval_tasks, num_fewshot=5, **COMMON_CONFIG)
