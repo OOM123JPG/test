@@ -90,4 +90,4 @@ if __name__ == "__main__":
     }
 
     with open(os.path.join(args.save_prefix_path, f"_{TASK_PREFIX}.yaml"), "w", encoding="utf-8") as f:
-        yaml.dump(group_yaml_dict
+        yaml.dump(group_yaml_dict, f, width=float("inf"), allow_unicode=True, default_style='"')
