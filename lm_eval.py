@@ -61,6 +61,9 @@ def run_api_eval(
     num_concurrent: int = 10,
     limit: int = 1,
     num_fewshot: int = 0,
+    max_gen_toks: int = 256,
+    temperature: float = 0.0, 
+    **kwargs
 ):
     """
     运行 API 评测脚本
@@ -75,11 +78,14 @@ def run_api_eval(
         model=model_name,
         base_url=base_url,
         tokenizer=tokenizer_path,
-        tokenizer_backend="huggingface",  # 使用本地 HuggingFace tokenizer
+        tokenizer_backend="huggingface",
         batch_size=batch_size,
-        num_concurrent=num_concurrent,    # 并发请求数
-        tokenized_requests=False,         # 传输原始字符串
-        max_retries=3
+        num_concurrent=num_concurrent,
+        max_gen_toks=max_gen_toks, # 注入长度限制
+        temperature=temperature,    # 注入温度
+        tokenized_requests=False,
+        max_retries=3,
+        **kwargs                    # 透传其他参数
     )
 
     task_manager = TaskManager()
@@ -134,32 +140,34 @@ def run_api_eval(
 
 if __name__ == "__main__":
     # 配置参数
-    CONFIG = {
+    COMMON_CONFIG = {
         "model_name": "deepseek-v3-tucker",
         "tokenizer_path": "/nfs-share/wx1463835/download/model/DeepSeek-V3-bf16",
-        "base_url": "http://127.0.0.1:8000/v1/completions",  # 请根据你的实际 API 地址修改
-        "task_names": ["piqa"], 
-        "num_concurrent": 10,  # 并发数
-        "limit": 1,            # 仅测试 1 条数据
+        "base_url": "http://127.0.0.1:8000/v1/completions",
+        "num_concurrent": 10,
         "batch_size": 1,
+        "limit": None,
+        "temperature": 0.0, # 评测通常强制要求 temperature=0
     }
 
-    # run_api_eval(**CONFIG)
-
     eval_groups = [
-        ("LMEH 通用任务 (0-shot)", general_tasks, 0),
-        ("MMLU 任务 (5-shot)", mmlu_tasks, 5),
-        ("C-Eval 任务 (5-shot)", ceval_tasks, 5)
+        # (组名, 任务列表, fewshot, 最大长度)
+        ("LMEH 通用任务", general_tasks, 0, 16),  # 选择题 16 足够
+        ("MMLU 任务", mmlu_tasks, 5, 16),      # 选择题只需概率，长度不影响
+        ("C-Eval 任务", ceval_tasks, 5, 16),    # 同上
     ]
 
-    for group_name, tasks, shot in eval_groups:
-        print(f"\n>>> 准备进入组别评估: {group_name}")
+    for group_name, tasks, shot, max_len in eval_groups:
+        print(f"\n>>> 运行组别: {group_name}")
         try:
-            # 调用函数
-            run_api_eval(task_names=tasks, num_fewshot=shot, **COMMON_CONFIG)
+            run_api_eval(
+                task_names=tasks, 
+                num_fewshot=shot, 
+                max_gen_toks=max_len, 
+                **COMMON_CONFIG
+            )
         except Exception as e:
-            # 如果某一组因为 API 连接、初始化等严重问题挂了，捕获它，继续下一组
-            logger.critical(f"严重错误：评估组 [{group_name}] 整体执行失败，正在尝试跳至下一组。错误详情: {e}")
+            logger.critical(f"组别 {group_name} 崩溃: {e}")
             continue
 
     print("\n" + "="*50)
