@@ -21,6 +21,10 @@ print("Attempting to load file...")
 data = torch.load(path, map_location='cpu')
 print("Load success. Keys:", data.keys())
 
+# 在 Node 0 执行，杀掉所有残留的推理进程
+# ps -ef | grep python | grep -v grep | awk '{print $2}' | xargs -r kill -9
+# netstat -anp | grep 29506
+
 # import os
 # import torch
 # import torch.distributed as dist
