@@ -323,7 +323,7 @@ async def chat_completions(request: ChatCompletionRequest):
     await event.wait(); res = engine.results.pop(req_id); del engine.events[req_id]
     return {"id": req_id, "object": "chat.completion", "choices": [{"message": {"role": "assistant", "content": res}, "index": 0, "finish_reason": "stop"}]}
 
-@@app.post("/v1/completions")
+@app.post("/v1/completions")
 async def completions(request: CompletionRequest):
     req_id_base = str(uuid.uuid4())
     prompts = [request.prompt] if isinstance(request.prompt, str) else request.prompt
