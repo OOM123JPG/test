@@ -323,7 +323,7 @@ async def chat_completions(request: ChatCompletionRequest):
     await event.wait(); res = engine.results.pop(req_id); del engine.events[req_id]
     return {"id": req_id, "object": "chat.completion", "choices": [{"message": {"role": "assistant", "content": res}, "index": 0, "finish_reason": "stop"}]}
 
-@app.post("/v1/completions")
+@@app.post("/v1/completions")
 async def completions(request: CompletionRequest):
     req_id_base = str(uuid.uuid4())
     prompts = [request.prompt] if isinstance(request.prompt, str) else request.prompt
@@ -347,28 +347,42 @@ async def completions(request: CompletionRequest):
             "cont_len": 2048 # 默认上限
         })
     
+    # 等待所有并发请求完成
     await asyncio.gather(*(ev.wait() for ev in events))
     
     choices = []
     for i, rid in enumerate(results_ids):
+        # 从结果池中获取推理结果
         res = engine.results.pop(rid)
         del engine.events[rid]
+        
         if is_ll:
-            # res 这里是 List[float] (每个 token 的 logprobs)
+            # 这里的 res 是 List[float]，代表序列中每个 token 的 logprobs
+            # 为了修复 max() 报错，top_logprobs 必须包含实际的数值字典
             choices.append({
                 "text": prompts[i] if request.echo else "", 
                 "index": i, 
                 "logprobs": {
                     "token_logprobs": res, 
                     "tokens": ["<token>"] * len(res), 
-                    "top_logprobs": [{}] * len(res)
+                    # 将每一个 token 的概率放入字典，防止客户端 max(top.values()) 报错
+                    "top_logprobs": [{"<token>": val} for val in res] 
                 }, 
                 "finish_reason": "stop"
             })
         else:
-            choices.append({"text": res, "index": i, "finish_reason": "stop"})
+            # 普通生成任务返回文本结果
+            choices.append({
+                "text": res, 
+                "index": i, 
+                "finish_reason": "stop"
+            })
             
-    return {"id": req_id_base, "object": "text_completion", "choices": choices}
+    return {
+        "id": req_id_base, 
+        "object": "text_completion", 
+        "choices": choices
+    }
 
 def main():
     parser = argparse.ArgumentParser()
