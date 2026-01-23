@@ -2,73 +2,71 @@ import os
 import json
 import logging
 import pandas as pd
+import torch
 from lm_eval import evaluator
 from lm_eval.tasks import TaskManager
-from lm_eval.models.openai_completions import LocalChatCompletionsLM
+from lm_eval.models.openai_completions import LocalCompletionsAPI
 
-# 配置日志
+# 配置日志输出
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-eval_logger = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 def run_api_eval(
     model_name: str,
     base_url: str,
     tokenizer_path: str,
-    api_key: str = "EMPTY",
     task_names: list = None,
     batch_size: int = 1,
-    num_concurrent: int = 10,
-    output_csv: str = "api_results.csv",
-    limit: int = None,
-    num_fewshot: int = 0
+    limit: int = 1,
+    num_fewshot: int = 0,
+    output_csv: str = "results_api.csv"
 ):
     """
-    通过 API 接口运行 lm-evaluation-harness 评测
+    运行 API 评测脚本，支持 loglikelihood 任务 (如 piqa)
     """
     if task_names is None:
-        task_names = ["openbookqa", "arc_easy", "winogrande", "arc_challenge", "piqa"]
+        task_names = ["piqa"]
 
-    output_dir = os.path.dirname(os.path.abspath(output_csv))
+    # 准备输出目录
+    output_dir = os.path.dirname(os.path.abspath(output_csv)) or "."
     json_dir = os.path.join(output_dir, "eval_details")
     os.makedirs(json_dir, exist_ok=True)
 
-    # ================= 检查断点续传 =================
+    # ================= 1. 检查已完成的任务 (断点续传) =================
     finished_tasks = set()
     if os.path.exists(output_csv):
         try:
             existing_df = pd.read_csv(output_csv)
             if 'task' in existing_df.columns:
                 finished_tasks = set(existing_df['task'].astype(str).tolist())
-                eval_logger.info(f">>> 已完成任务: {len(finished_tasks)} 个，将跳过。")
+                logger.info(f">>> 检测到结果文件，已跳过任务: {finished_tasks}")
         except Exception as e:
-            eval_logger.warning(f">>> 读取旧结果失败: {e}")
+            logger.warning(f">>> 读取现有 CSV 失败: {e}")
 
-    # ================= 初始化 API 模型包装器 =================
-    # 根据你的接口类型选择：
-    # 如果是 /v1/chat/completions 接口，使用 LocalChatCompletionsLM
-    # 如果是 /v1/completions 接口，使用 LocalCompletionsLM
-    lm_obj = LocalChatCompletionsLM(
+    # ================= 2. 初始化 API 模型包装器 =================
+    # 使用 LocalCompletionsAPI 以支持 piqa 等多选任务所需的 loglikelihood
+    lm_obj = LocalCompletionsAPI(
         model=model_name,
         base_url=base_url,
         tokenizer=tokenizer_path,
-        tokenizer_backend="huggingface", # 指定使用 HF 的 tokenizer 逻辑
-        num_concurrent=num_concurrent,
+        tokenizer_backend="huggingface",  # 确保使用本地 HF Tokenizer
         batch_size=batch_size,
-        tokenized_requests=False, # API 模式下通常传字符串
+        tokenized_requests=False,         # API 模式下发送 Raw Text
         max_retries=3
     )
-    
-    # 注入 API Key (如果需要)
-    # lm_obj.api_key = api_key 
 
     task_manager = TaskManager()
     all_results = []
 
+    # ================= 3. 循环执行任务 =================
     for task in task_names:
         if task in finished_tasks:
             continue
-        
-        eval_logger.info(f"\n===== 开始评估任务 (API 模式): {task} =====")
+
+        logger.info(f"\n" + "="*50)
+        logger.info(f"开始评估任务: {task} (limit={limit}, batch_size={batch_size})")
+        logger.info("="*50)
+
         try:
             results = evaluator.simple_evaluate(
                 model=lm_obj,
@@ -76,47 +74,51 @@ def run_api_eval(
                 num_fewshot=num_fewshot,
                 limit=limit,
                 task_manager=task_manager,
-                # API 模式下建议减小 verbosity 以观察进度
+                log_samples=True
             )
         except Exception as e:
-            eval_logger.error(f"任务 {task} 运行出错: {e}")
+            logger.error(f"任务 {task} 失败: {e}")
             continue
 
-        # 保存样本
+        # 保存详细样本数据
         if "samples" in results:
-            json_file = os.path.join(json_dir, f"{task}_samples.json")
-            with open(json_file, "w", encoding="utf-8") as f:
+            sample_file = os.path.join(json_dir, f"{task}_samples.json")
+            with open(sample_file, "w", encoding="utf-8") as f:
                 json.dump(results["samples"], f, ensure_ascii=False, indent=2)
-        
-        # 提取数据
-        task_results = results["results"].get(task, {})
-        acc = task_results.get("acc,none") or task_results.get("acc")
-        acc_norm = task_results.get("acc_norm,none") or task_results.get("acc_norm")
 
-        row = {
+        # 提取指标数据
+        task_res = results["results"].get(task, {})
+        # piqa 常用指标是 acc 或 acc_norm
+        acc = task_res.get("acc,none") or task_res.get("acc")
+        acc_norm = task_res.get("acc_norm,none") or task_res.get("acc_norm")
+
+        res_row = {
             "task": task,
-            "acc(%)": f"{acc*100:.2f}%" if acc is not None else "—",
-            "acc_norm(%)": f"{acc_norm*100:.2f}%" if acc_norm is not None else "—",
+            "acc(%)": f"{acc*100:.2f}%" if acc is not None else "N/A",
+            "acc_norm(%)": f"{acc_norm*100:.2f}%" if acc_norm is not None else "N/A",
         }
 
-        eval_logger.info(f">>> 结果: {row}")
-        all_results.append(row)
+        print(f"\n>>> [{task}] 评测完成!")
+        print(f"指标结果: {res_row}")
+        all_results.append(res_row)
 
-        # 实时保存
-        df = pd.DataFrame([row])
-        df.to_csv(output_csv, index=False, mode='a', header=not os.path.exists(output_csv))
+        # 实时保存到 CSV
+        df_row = pd.DataFrame([res_row])
+        df_row.to_csv(output_csv, index=False, mode='a', header=not os.path.exists(output_csv))
 
+    logger.info("\n所有评估任务已结束。")
     return pd.DataFrame(all_results)
 
 if __name__ == "__main__":
-    # 配置参数
-    CONFIG = {
-        "model_name": "qwen2.5-7b-instruct",           # 接口中的模型名称
-        "base_url": "http://127.0.0.1:8000/v1/chat/completions", # 你的 API 地址
-        "tokenizer_path": "/path/to/your/tokenizer",   # 你的本地 Tokenizer 路径
-        "task_names": ["arc_easy", "hellaswag"],       # 评测任务
-        "num_concurrent": 8,                           # 并发请求数
-        "limit": None                                  # 测试时可以设为 10
+    # 配置你的 API 和路径
+    PARAMS = {
+        "model_name": "your-model-name",               # 模型在 API 中的注册名
+        "base_url": "http://127.0.0.1:8000/v1/completions", # 必须使用 completions 结尾
+        "tokenizer_path": "/path/to/your/tokenizer",   # 本地 Tokenizer 路径
+        "task_names": ["piqa"],                        # 可以改为 ["piqa", "arc_easy", "winogrande"]
+        "limit": 1,                                    # 样本限制
+        "batch_size": 1,                               # 批次大小
+        "output_csv": "api_eval_results.csv"
     }
 
-    run_api_eval(**CONFIG)
+    run_api_eval(**PARAMS)
