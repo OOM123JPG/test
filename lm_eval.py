@@ -5,6 +5,7 @@ import pandas as pd
 from lm_eval import evaluator
 from lm_eval.tasks import TaskManager
 from lm_eval.models.openai_completions import LocalCompletionsAPI
+from lm_eval.utils import handle_non_serializable
 
 # 配置日志输出，设为 INFO 级别以查看进度
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -56,6 +57,7 @@ def run_api_eval(
     model_name: str,
     base_url: str,
     tokenizer_path: str,
+    output_dir: str,  # 外面传进来的基础路径
     task_names: list = None,
     batch_size: int = 1,
     num_concurrent: int = 10,
@@ -66,14 +68,17 @@ def run_api_eval(
     **kwargs
 ):
     """
-    运行 API 评测脚本
+    运行 API 评测脚本，支持路径复用和结果自动保存
     """
     if task_names is None:
         task_names = ["piqa"]
 
-    # ================= 1. 初始化 API 模型包装器 =================
-    # 使用 LocalCompletionsAPI 以支持 piqa 所需的 loglikelihood 功能
-    # num_concurrent 将通过 **kwargs 传递给基类 TemplateAPI
+    # 1. 确保目录结构存在
+    details_dir = os.path.join(output_dir, "details")
+    os.makedirs(details_dir, exist_ok=True)
+    csv_path = os.path.join(output_dir, "results_api.csv")
+
+    # 2. 初始化模型
     lm_obj = LocalCompletionsAPI(
         model=model_name,
         base_url=base_url,
@@ -81,95 +86,105 @@ def run_api_eval(
         tokenizer_backend="huggingface",
         batch_size=batch_size,
         num_concurrent=num_concurrent,
-        max_gen_toks=max_gen_toks, # 注入长度限制
-        temperature=temperature,    # 注入温度
+        max_gen_toks=max_gen_toks,
+        temperature=temperature,
         tokenized_requests=False,
         max_retries=3,
-        **kwargs                    # 透传其他参数
+        **kwargs
     )
 
     task_manager = TaskManager()
     all_results = []
 
-    # ================= 2. 循环执行任务 =================
+    # 3. 循环执行任务
     for task in task_names:
-        logger.info(f"\n" + "="*50)
-        logger.info(f"开始评估任务: {task} (并发数: {num_concurrent}, limit: {limit})")
-        logger.info("="*50)
+        logger.info(f"\n{'='*50}\n开始评估任务: {task} (limit: {limit})\n{'='*50}")
 
         try:
-            # 运行评测
+            # 调用 evaluator.py 中的核心评估逻辑
             results = evaluator.simple_evaluate(
                 model=lm_obj,
                 tasks=[task],
                 num_fewshot=num_fewshot,
                 limit=limit,
                 task_manager=task_manager,
+                log_samples=True # 记录模型生成的样本详情
             )
         except Exception as e:
             logger.error(f"任务 {task} 运行失败: {e}")
             continue
 
-        # 提取指标数据
+        # 4. 提取指标
         task_res = results["results"].get(task, {})
         acc = task_res.get("acc,none") or task_res.get("acc")
         acc_norm = task_res.get("acc_norm,none") or task_res.get("acc_norm")
 
-        # 构建结果行
         res_row = {
             "task": task,
+            "fewshot": num_fewshot,
             "acc(%)": f"{acc*100:.2f}%" if acc is not None else "N/A",
             "acc_norm(%)": f"{acc_norm*100:.2f}%" if acc_norm is not None else "N/A",
         }
-        
-        # 转换为 DataFrame 方便查看
         df_row = pd.DataFrame([res_row])
-        
-        # 打印 df_row
-        print("\n>>> 当前任务结果预览 (df_row):")
-        print(df_row)
-        print("-" * 30)
+        print(f"\n>>> 任务 {task} 结果预览:\n{df_row}\n{'-'*30}")
 
-        # 实时保存到 CSV (根据要求已注释)
-        # df_row.to_csv("results_api.csv", index=False, mode='a', header=not os.path.exists("results_api.csv"))
+        # 5. 保存结果：写入 CSV (追加模式)
+        df_row.to_csv(csv_path, index=False, mode='a', header=not os.path.exists(csv_path))
         
+        # 6. 保存结果：写入详细 JSON (包含 samples)
+        json_output_path = os.path.join(details_dir, f"detail_{task}.json")
+        with open(json_output_path, "w", encoding="utf-8") as f:
+            json.dump(results, f, indent=2, default=handle_non_serializable, ensure_ascii=False)
+        
+        logger.info(f"任务 {task} 的详细结果已保存至: {json_output_path}")
         all_results.append(res_row)
 
-    logger.info("\n所有任务已执行完毕。")
     return pd.DataFrame(all_results)
 
 if __name__ == "__main__":
-    # 配置参数
+    # 统一路径配置
+    BASE_OUTPUT_PATH = "/nfs-share/wx1463835/tdmoe/output/evaluation"
+    
     COMMON_CONFIG = {
         "model_name": "deepseek-v3-tucker",
         "tokenizer_path": "/nfs-share/wx1463835/download/model/DeepSeek-V3-bf16",
         "base_url": "http://127.0.0.1:8000/v1/completions",
+        "output_dir": BASE_OUTPUT_PATH, # 传入基础路径
         "num_concurrent": 10,
         "batch_size": 1,
         "limit": None,
-        "temperature": 0.0, # 评测通常强制要求 temperature=0
+        "temperature": 0.0,
     }
 
-    eval_groups = [
-        # (组名, 任务列表, fewshot, 最大长度)
-        ("LMEH 通用任务", general_tasks, 0, 16),  # 选择题 16 足够
-        ("MMLU 任务", mmlu_tasks, 5, 16),      # 选择题只需概率，长度不影响
-        ("C-Eval 任务", ceval_tasks, 5, 16),    # 同上
-    ]
+    # 配置参数字典：Key 是组名，Value 是该组的特定配置
+    eval_groups = {
+        "LMEH 通用任务": {
+            "tasks": general_tasks,
+            "num_fewshot": 0,
+            "max_gen_toks": 16,
+        },
+        "MMLU 任务": {
+            "tasks": mmlu_tasks,
+            "num_fewshot": 5,
+            "max_gen_toks": 16,
+        },
+        "C-Eval 任务": {
+            "tasks": ceval_tasks,
+            "num_fewshot": 5,
+            "max_gen_toks": 256,
+        },
+    }
 
-    for group_name, tasks, shot, max_len in eval_groups:
-        print(f"\n>>> 运行组别: {group_name}")
+    for group_name, config in eval_groups.items():
+        logger.info(f"\n>>> 运行组别: {group_name}")
         try:
             run_api_eval(
-                task_names=tasks, 
-                num_fewshot=shot, 
-                max_gen_toks=max_len, 
+                task_names=config["tasks"], 
+                num_fewshot=config["num_fewshot"], 
+                max_gen_toks=config["max_gen_toks"], 
                 **COMMON_CONFIG
             )
         except Exception as e:
             logger.critical(f"组别 {group_name} 崩溃: {e}")
-            continue
 
-    print("\n" + "="*50)
-    print("所有评估流程执行尝试已结束。")
-    print("="*50)
+    print(f"\n{'='*50}\n所有评估任务已结束。总表请查看: {os.path.join(BASE_OUTPUT_PATH, 'results_api.csv')}\n{'='*50}")
