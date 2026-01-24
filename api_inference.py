@@ -269,7 +269,7 @@ class DistributedInferenceEngine:
     #             dist.send(tensor=relevant_logprobs.to("npu:0").to(torch.float32).contiguous(), dst=0)
     #             return relevant_logprobs.tolist()
     
-    # 修改 loglikelihood 接口
+    # 修改 loglikelihood 接口 
     def _execute_loglikelihood_sync(self, input_ids, batch_size, p_args):
         with torch.no_grad():
             q_len = input_ids.shape[1]
@@ -294,16 +294,13 @@ class DistributedInferenceEngine:
                     h = layer(h.to(next(layer.parameters()).device), attention_mask=mask.to(next(layer.parameters()).device), use_cache=False)[0]
                 
                 logits = self.model.lm_head(self.model.model.norm(h.to(next(self.model.lm_head.parameters()).device)))
-                
-                # --- 核心改进：强制 float32 提高选择精度 ---
                 logprobs = F.log_softmax(logits.float(), dim=-1)
                 
-                # --- 核心改进：索引对齐 ---
                 target_ids = input_ids[:, 1:].unsqueeze(-1).to(logprobs.device)
-                relevant_logprobs = logprobs[:, :-1, :].gather(-1, target_ids).squeeze(-1) # [batch, q_len-1]
+                relevant_logprobs = logprobs[:, :-1, :].gather(-1, target_ids).squeeze(-1) 
                 
-                # 在第0位补0，使长度与 input_ids 一致
-                padding_val = torch.zeros((batch_size, 1), device="npu:0", dtype=relevant_logprobs.dtype)
+                # 修复处：使用 new_zeros 确保设备严格一致
+                padding_val = relevant_logprobs.new_zeros((batch_size, 1))
                 final_logprobs = torch.cat([padding_val, relevant_logprobs], dim=-1)
                 
                 dist.send(tensor=final_logprobs.to("npu:0").to(torch.float32).contiguous(), dst=0)
@@ -463,9 +460,10 @@ async def completions(request: CompletionRequest):
     prompts = [request.prompt] if isinstance(request.prompt, str) else request.prompt
     is_ll = (request.logprobs is not None and request.logprobs > 0)
     
-    # 提前编码以获取 input_ids 用于 token 还原
+    # 1. 明确 Tokenizer 编码后的设备 (建议保持 CPU 以处理字符串转换，但在比较时需注意)
     encoded = engine.tokenizer(prompts, padding=True, return_tensors="pt")
-    all_input_ids = encoded.input_ids
+    # 保持在 CPU 上用于 convert_ids_to_tokens 这种 CPU 密集型操作
+    all_input_ids = encoded.input_ids 
 
     events, results_ids = [], []
     for i, p in enumerate(prompts):
@@ -488,17 +486,20 @@ async def completions(request: CompletionRequest):
         del engine.events[rid]
         
         if is_ll:
-            # --- 核心改进：Token 还原与 Padding 过滤 ---
-            token_ids = all_input_ids[i]
+            token_ids = all_input_ids[i] # 位于 CPU
             tokens_str = engine.tokenizer.convert_ids_to_tokens(token_ids)
             
+            # 2. 这里的逻辑在 CPU 执行，不会报错，但为了严谨，
+            # 如果 pad_token_id 很大或涉及复杂 Tensor 操作，建议加上 .to(token_ids.device)
+            pad_id = engine.tokenizer.pad_token_id
+            
             # 找到第一个非 pad token
-            first_valid = (token_ids != engine.tokenizer.pad_token_id).long().argmax().item()
+            # 直接在 CPU 向量化计算
+            first_valid = (token_ids != pad_id).long().argmax().item()
             
             valid_tokens = tokens_str[first_valid:]
             valid_logprobs = res[first_valid:]
             
-            # 格式化 top_logprobs
             top_lp = [{t: lp} for t, lp in zip(valid_tokens, valid_logprobs)]
 
             choices.append({
