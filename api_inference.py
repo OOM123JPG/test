@@ -107,7 +107,7 @@ class DistributedInferenceEngine:
 
         full_model = AutoModelForCausalLM.from_pretrained(self.args.model_path, torch_dtype=torch.bfloat16, trust_remote_code=True, device_map={"": "cpu"})
         
-        mid = 29
+        mid = 34
         all_l = full_model.model.layers
         if self.args.node_rank == 0:
             full_model.model.layers = nn.ModuleList([all_l[i] for i in range(mid)])
@@ -324,8 +324,12 @@ class DistributedInferenceEngine:
         with torch.no_grad():
             q_len = input_ids.shape[1]
             padding_mask = (input_ids != self.tokenizer.pad_token_id).long().to("npu:0")
+            # causal_mask = torch.triu(torch.full((q_len, q_len), float("-inf"), device="npu:0"), 1)
+            # mask = causal_mask.view(1, 1, q_len, q_len) + (1.0 - padding_mask.view(batch_size, 1, 1, q_len).to(torch.bfloat16)) * -10000.0
+            
             causal_mask = torch.triu(torch.full((q_len, q_len), float("-inf"), device="npu:0"), 1)
-            mask = causal_mask.view(1, 1, q_len, q_len) + (1.0 - padding_mask.view(batch_size, 1, 1, q_len).to(torch.bfloat16)) * -10000.0
+            causal_mask = causal_mask.view(1, 1, q_len, q_len).expand(batch_size, -1, -1, -1)
+            mask = causal_mask + (1.0 - padding_mask.view(batch_size, 1, 1, q_len).to(torch.bfloat16)) * -10000.0
             
             if self.args.node_rank == 0:
                 h = self.model.model.embed_tokens(input_ids)
@@ -367,32 +371,53 @@ class DistributedInferenceEngine:
                 is_prefill = (step == 0)
                 total_len = curr_input_ids.shape[1] if is_prefill else len(batch_ids[0])
                 q_len = curr_input_ids.shape[1]
+                
                 if is_prefill:
+                    # ========== Prefill 阶段：使用完整的 causal mask ==========
                     causal_mask = torch.triu(torch.full((q_len, q_len), float("-inf"), device="npu:0"), 1)
-                    mask = causal_mask.view(1, 1, q_len, q_len) + (1.0 - current_mask.view(batch_size, 1, 1, q_len).to(torch.bfloat16)) * -10000.0
-                else: mask = (1.0 - current_mask.view(batch_size, 1, 1, total_len).to(torch.bfloat16)) * -10000.0
+                    causal_mask = causal_mask.view(1, 1, q_len, q_len).expand(batch_size, -1, -1, -1)
+                    mask = causal_mask + (1.0 - current_mask.view(batch_size, 1, 1, q_len).to(torch.bfloat16)) * -10000.0
+                else:
+                    # ========== Decoding 阶段：只使用 padding mask ==========
+                    mask = (1.0 - current_mask.view(batch_size, 1, 1, total_len).to(torch.bfloat16)) * -10000.0
+                
                 if self.args.node_rank == 0:
                     h = self.model.model.embed_tokens(curr_input_ids)
-                    for layer in self.model.model.layers: h = layer(h.to(next(layer.parameters()).device), attention_mask=mask.to(next(layer.parameters()).device), position_ids=position_ids.to(next(layer.parameters()).device), past_key_value=past_key_values, use_cache=True)[0]
+                    for layer in self.model.model.layers: 
+                        h = layer(h.to(next(layer.parameters()).device), 
+                                attention_mask=mask.to(next(layer.parameters()).device), 
+                                position_ids=position_ids.to(next(layer.parameters()).device), 
+                                past_key_value=past_key_values, use_cache=True)[0]
                     dist.send(tensor=h.to("npu:0").to(torch.bfloat16).contiguous(), dst=1)
                     new_ids_dev = torch.zeros((batch_size, 1), dtype=torch.long, device="npu:0")
                     dist.recv(tensor=new_ids_dev, src=1); curr_input_ids = new_ids_dev
                 else:
                     h_recv = torch.zeros((batch_size, q_len, self.model.config.hidden_size), dtype=torch.bfloat16, device="npu:0")
                     dist.recv(tensor=h_recv, src=0); h = h_recv
-                    for layer in self.model.model.layers: h = layer(h.to(next(layer.parameters()).device), attention_mask=mask.to(next(layer.parameters()).device), position_ids=position_ids.to(next(layer.parameters()).device), past_key_value=past_key_values, use_cache=True)[0]
+                    for layer in self.model.model.layers: 
+                        h = layer(h.to(next(layer.parameters()).device), 
+                                attention_mask=mask.to(next(layer.parameters()).device), 
+                                position_ids=position_ids.to(next(layer.parameters()).device), 
+                                past_key_value=past_key_values, use_cache=True)[0]
                     logits = self.model.lm_head(self.model.model.norm(h.to(next(self.model.lm_head.parameters()).device)))[:, -1, :]
                     logits = apply_sampling(logits, p_args['temp'], p_args['top_p'], 1.1, batch_ids)
                     next_tokens = torch.multinomial(torch.softmax(logits, dim=-1), 1) if p_args['temp'] > 0 else torch.argmax(logits, -1, True)
                     dist.send(tensor=next_tokens.to("npu:0").contiguous(), dst=0); curr_input_ids = next_tokens.to("npu:0")
+                
                 nt_list = curr_input_ids.squeeze(-1).tolist()
                 for i in range(batch_size):
                     if not finished[i]:
                         batch_ids[i].append(nt_list[i])
-                        if nt_list[i] == self.tokenizer.eos_token_id: finished[i] = True
-                if all(finished): break
+                        if nt_list[i] == self.tokenizer.eos_token_id: 
+                            finished[i] = True
+                
+                if all(finished): 
+                    break
+                    
+                # 更新mask和position_ids用于下一轮
                 current_mask = torch.cat([current_mask, torch.ones((batch_size, 1), device="npu:0")], dim=-1)
-                position_ids = torch.full((batch_size, 1), len(batch_ids[0]) - 1, dtype=torch.long, device="npu:0")
+                position_ids = torch.full((batch_size, 1), current_mask.shape[1] - 1, dtype=torch.long, device="npu:0")
+        
         return [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in batch_ids]
 
 # ==========================================
@@ -718,7 +743,3 @@ def main():
     else: asyncio.run(engine.run_loop())
 
 if __name__ == "__main__": main()
-
-
-
-# 3个修改的版本
