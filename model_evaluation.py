@@ -25,7 +25,7 @@ def run_winogrande_evaluation():
         # 通过dataset_args指定本地数据集路径
         dataset_args={
             'winogrande': {
-                'local_path': '/path/to/your/local/winogrande/dataset',  # 本地数据集路径
+                'local_path': '/data/yuebin/tdmoe/test/data/AI-ModelScope___winogrande_val/default-8f579396871af816/0.0.0/master',  # 本地数据集路径
                 'subset_list': ['validation']  # 指定要评测的子集
             }
         },
