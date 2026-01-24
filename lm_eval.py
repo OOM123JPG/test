@@ -148,7 +148,7 @@ if __name__ == "__main__":
     COMMON_CONFIG = {
         "model_name": "deepseek-v3-tucker",
         "tokenizer_path": "/nfs-share/wx1463835/download/model/DeepSeek-V3-bf16",
-        "base_url": "http://127.0.0.1:8000/v1/completions",
+        "base_url": "http://127.0.0.1:8888/v1/completions",
         "output_dir": BASE_OUTPUT_PATH, # 传入基础路径
         "num_concurrent": 10,
         "batch_size": 1,

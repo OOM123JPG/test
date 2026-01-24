@@ -123,7 +123,7 @@ class DistributedInferenceEngine:
 
     def _pipeline_surgery_and_loading(self):
         num_layers = len(self.model.model.layers)
-        RESERVED, main_npu = 12, "npu:0"
+        RESERVED, main_npu = 8, "npu:0"
         
         def surgery_task(idx_in_module, layer):
             real_idx = self.start_idx + idx_in_module
@@ -504,49 +504,175 @@ async def chat_completions(request: ChatCompletionRequest):
     
     
 # 修改 completions 接口 支持批处理
+# @app.post("/v1/completions")
+# async def completions(request: CompletionRequest):
+#     req_id_base = str(uuid.uuid4())
+#     prompts = [request.prompt] if isinstance(request.prompt, str) else request.prompt
+#     is_ll = (request.logprobs is not None and request.logprobs > 0)
+    
+#     # 1. 批量编码所有prompts
+#     encoded = engine.tokenizer(prompts, padding=True, return_tensors="pt")
+#     all_input_ids = encoded.input_ids
+    
+#     # 2. 动态计算cont_len：基于最长序列长度
+#     max_input_len = all_input_ids.shape[1]
+#     cont_len = max_input_len if is_ll else 2048  # loglikelihood需要精确长度
+    
+#     # 3. 创建批量请求ID列表
+#     batch_ids = [f"{req_id_base}-{i}" for i in range(len(prompts))]
+    
+#     # 4. 创建批量事件
+#     events = {rid: asyncio.Event() for rid in batch_ids}
+#     engine.events.update(events)
+    
+#     # 5. 发送批量请求（单个批量请求，包含所有prompts）
+#     await engine.req_queue.put({
+#         "type": "loglikelihood" if is_ll else "chat",
+#         "batch_ids": batch_ids,  # 改为批量ID
+#         "prompts": prompts,      # 批量prompts
+#         "max_tokens": request.max_tokens,
+#         "temp": request.temperature,
+#         "top_p": request.top_p,
+#         "cont_len": cont_len     # 动态长度
+#     })
+    
+#     # 6. 等待所有批量结果完成
+#     await asyncio.gather(*(events[rid].wait() for rid in batch_ids))
+    
+#     # 7. 收集批量结果
+#     choices = []
+#     for i, rid in enumerate(batch_ids):
+#         res = engine.results.pop(rid)
+#         del engine.events[rid]
+        
+#         if is_ll:
+#             token_ids = all_input_ids[i]
+#             tokens_str = engine.tokenizer.convert_ids_to_tokens(token_ids)
+#             pad_id = engine.tokenizer.pad_token_id
+            
+#             # 找到第一个非pad token
+#             first_valid = (token_ids != pad_id).long().argmax().item()
+            
+#             valid_tokens = tokens_str[first_valid:]
+#             valid_logprobs = res[first_valid:]
+            
+#             top_lp = [{t: lp} for t, lp in zip(valid_tokens, valid_logprobs)]
+            
+#             choices.append({
+#                 "text": prompts[i] if request.echo else "",
+#                 "index": i,
+#                 "logprobs": {
+#                     "token_logprobs": valid_logprobs,
+#                     "tokens": valid_tokens,
+#                     "top_logprobs": top_lp
+#                 },
+#                 "finish_reason": "stop"
+#             })
+#         else:
+#             choices.append({"text": res, "index": i, "finish_reason": "stop"})
+    
+#     return {"id": req_id_base, "object": "text_completion", "choices": choices}
+
 @app.post("/v1/completions")
 async def completions(request: CompletionRequest):
     req_id_base = str(uuid.uuid4())
-    prompts = [request.prompt] if isinstance(request.prompt, str) else request.prompt
     is_ll = (request.logprobs is not None and request.logprobs > 0)
     
-    # 1. 批量编码所有prompts
-    encoded = engine.tokenizer(prompts, padding=True, return_tensors="pt")
-    all_input_ids = encoded.input_ids
+    is_batch = isinstance(request.prompt, list)
     
-    # 2. 动态计算cont_len：基于最长序列长度
-    max_input_len = all_input_ids.shape[1]
-    cont_len = max_input_len if is_ll else 2048  # loglikelihood需要精确长度
+    if is_batch:
+        # ========== 批量请求处理 ==========
+        prompts = request.prompt
+        
+        # 1. 批量编码所有prompts
+        encoded = engine.tokenizer(prompts, padding=True, return_tensors="pt")
+        all_input_ids = encoded.input_ids
+        
+        # 2. 动态计算cont_len：基于最长序列长度
+        max_input_len = all_input_ids.shape[1]
+        cont_len = max_input_len if is_ll else 2048  # loglikelihood需要精确长度
+        
+        # 3. 创建批量请求ID列表
+        batch_ids = [f"{req_id_base}-{i}" for i in range(len(prompts))]
+        
+        # 4. 创建批量事件
+        events = {rid: asyncio.Event() for rid in batch_ids}
+        engine.events.update(events)
+        
+        # 5. 发送批量请求（单个批量请求，包含所有prompts）
+        await engine.req_queue.put({
+            "type": "loglikelihood" if is_ll else "chat",
+            "batch_ids": batch_ids,  # 改为批量ID
+            "prompts": prompts,      # 批量prompts
+            "max_tokens": request.max_tokens,
+            "temp": request.temperature,
+            "top_p": request.top_p,
+            "cont_len": cont_len     # 动态长度
+        })
+        
+        # 6. 等待所有批量结果完成
+        await asyncio.gather(*(events[rid].wait() for rid in batch_ids))
+        
+        # 7. 收集批量结果
+        choices = []
+        for i, rid in enumerate(batch_ids):
+            res = engine.results.pop(rid)
+            del engine.events[rid]
+            
+            if is_ll:
+                token_ids = all_input_ids[i]
+                tokens_str = engine.tokenizer.convert_ids_to_tokens(token_ids)
+                pad_id = engine.tokenizer.pad_token_id
+                
+                # 找到第一个非pad token
+                first_valid = (token_ids != pad_id).long().argmax().item()
+                
+                valid_tokens = tokens_str[first_valid:]
+                valid_logprobs = res[first_valid:]
+                
+                top_lp = [{t: lp} for t, lp in zip(valid_tokens, valid_logprobs)]
+                
+                choices.append({
+                    "text": prompts[i] if request.echo else "",
+                    "index": i,
+                    "logprobs": {
+                        "token_logprobs": valid_logprobs,
+                        "tokens": valid_tokens,
+                        "top_logprobs": top_lp
+                    },
+                    "finish_reason": "stop"
+                })
+            else:
+                choices.append({"text": res, "index": i, "finish_reason": "stop"})
+        
+        return {"id": req_id_base, "object": "text_completion", "choices": choices}
     
-    # 3. 创建批量请求ID列表
-    batch_ids = [f"{req_id_base}-{i}" for i in range(len(prompts))]
-    
-    # 4. 创建批量事件
-    events = {rid: asyncio.Event() for rid in batch_ids}
-    engine.events.update(events)
-    
-    # 5. 发送批量请求（单个批量请求，包含所有prompts）
-    await engine.req_queue.put({
-        "type": "loglikelihood" if is_ll else "chat",
-        "batch_ids": batch_ids,  # 改为批量ID
-        "prompts": prompts,      # 批量prompts
-        "max_tokens": request.max_tokens,
-        "temp": request.temperature,
-        "top_p": request.top_p,
-        "cont_len": cont_len     # 动态长度
-    })
-    
-    # 6. 等待所有批量结果完成
-    await asyncio.gather(*(events[rid].wait() for rid in batch_ids))
-    
-    # 7. 收集批量结果
-    choices = []
-    for i, rid in enumerate(batch_ids):
+    else:
+        # ========== 单请求处理==========
+        prompt = request.prompt
+        rid = req_id_base
+        event = asyncio.Event()
+        engine.events[rid] = event
+        
+        await engine.req_queue.put({
+            "type": "loglikelihood" if is_ll else "chat",
+            "id": rid,
+            "prompt": prompt,
+            "max_tokens": request.max_tokens,
+            "temp": request.temperature,
+            "top_p": request.top_p,
+            "cont_len": len(prompt) if is_ll else 2048
+        })
+        
+        await event.wait()
         res = engine.results.pop(rid)
         del engine.events[rid]
         
+        # 单结果处理
         if is_ll:
-            token_ids = all_input_ids[i]
+            # 为单请求重新编码以获取token信息
+            encoded = engine.tokenizer([prompt], padding=True, return_tensors="pt")
+            token_ids = encoded.input_ids[0]
             tokens_str = engine.tokenizer.convert_ids_to_tokens(token_ids)
             pad_id = engine.tokenizer.pad_token_id
             
@@ -558,20 +684,21 @@ async def completions(request: CompletionRequest):
             
             top_lp = [{t: lp} for t, lp in zip(valid_tokens, valid_logprobs)]
             
-            choices.append({
-                "text": prompts[i] if request.echo else "",
-                "index": i,
+            choices = [{
+                "text": prompt if request.echo else "",
+                "index": 0,
                 "logprobs": {
                     "token_logprobs": valid_logprobs,
                     "tokens": valid_tokens,
                     "top_logprobs": top_lp
                 },
                 "finish_reason": "stop"
-            })
+            }]
         else:
-            choices.append({"text": res, "index": i, "finish_reason": "stop"})
+            choices = [{"text": res, "index": 0, "finish_reason": "stop"}]
+        
+        return {"id": req_id_base, "object": "text_completion", "choices": choices}
     
-    return {"id": req_id_base, "object": "text_completion", "choices": choices}
 
 def main():
     parser = argparse.ArgumentParser()

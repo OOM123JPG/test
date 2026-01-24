@@ -75,11 +75,11 @@ class DistributedDeepSeekAdapter(ModelAPI):
         
         
     def batch_generate(self, inputs: List[List[ChatMessage]], 
-                      tools: List[List[ToolInfo]] = None,
-                      tool_choices: List[ToolChoice] = None,
-                      configs: List[GenerateConfig] = None,
-                      **kwargs) -> List[ModelOutput]:
-        """批处理生成：并发调用API"""
+                    tools: List[List[ToolInfo]] = None,
+                    tool_choices: List[ToolChoice] = None,
+                    configs: List[GenerateConfig] = None,
+                    **kwargs) -> List[ModelOutput]:
+        """真正的批处理生成：一次API调用处理多个样本"""
         
         if tools is None:
             tools = [[] for _ in inputs]
@@ -88,63 +88,84 @@ class DistributedDeepSeekAdapter(ModelAPI):
         if configs is None:
             configs = [self.config for _ in inputs]
         
-        logging.info(f"[batch_generate] 开始批处理，样本数: {len(inputs)}")
+        logging.info(f"[batch_generate] 开始真正的批处理，样本数: {len(inputs)}")
         
-        results = [None] * len(inputs)
+        # 检测任务类型
+        first_config = configs[0]
+        is_ll_batch = kwargs.get('logprobs') is not None or first_config.max_tokens == 1
         
-        # 使用线程池并发请求
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            # 提交所有任务
-            future_to_index = {}
-            for i, (input_msgs, input_tools, tool_choice, config) in enumerate(zip(inputs, tools, tool_choices, configs)):
-                future = executor.submit(self.generate, input_msgs, input_tools, tool_choice, config)
-                future_to_index[future] = i
-            
-            # 收集结果
-            for future in as_completed(future_to_index):
-                index = future_to_index[future]
-                try:
-                    result = future.result()
-                    results[index] = result
-                    logging.debug(f"[batch_generate] 样本 {index} 完成")
-                except Exception as e:
-                    logging.error(f"[batch_generate] 样本 {index} 失败: {e}")
-                    results[index] = ModelOutput.from_content(
-                        model=self.model_name,
-                        content="",
-                        error=str(e)
-                    )
+        # 检查配置是否一致
+        if not all(config.max_tokens == first_config.max_tokens and 
+                config.temperature == first_config.temperature and
+                config.top_p == first_config.top_p for config in configs):
+            logging.warning("[batch_generate] 配置不一致，使用并发单请求模式")
+            return self._fallback_batch_generate(inputs, tools, tool_choices, configs, **kwargs)
         
-        successful_count = sum(1 for r in results if r and not r.error)
-        logging.info(f"[batch_generate] 批处理完成，成功: {successful_count}/{len(inputs)}")
-        
-        return results
-
-    def _convert_chat_messages(self, messages: List[ChatMessage]) -> List[Dict[str, Any]]:
-        """转换ChatMessage为API期望的格式"""
-        converted = []
-        
-        for msg in messages:
-            if hasattr(msg, 'role') and hasattr(msg, 'content'):
-                # 已经是标准格式
-                converted.append({
-                    "role": msg.role,
-                    "content": msg.content
-                })
-            elif hasattr(msg, 'text'):
-                # 兼容旧格式，假设是用户消息
-                converted.append({
-                    "role": "user", 
-                    "content": msg.text
-                })
+        try:
+            if is_ll_batch:
+                # ========== loglikelihood 任务：参数固定 ==========
+                target_url = self.completions_url
+                
+                # 转换所有输入为prompts列表
+                prompts = []
+                for input_msgs in inputs:
+                    prompt = input_msgs if isinstance(input_msgs, str) else input_msgs[-1].content
+                    prompts.append(prompt)
+                
+                request_data = {
+                    "model": self.model_name,
+                    "prompt": prompts,
+                    "max_tokens": 1,        # loglikelihood 固定参数
+                    "logprobs": 1,          # loglikelihood 固定参数  
+                    "echo": True,           # loglikelihood 固定参数
+                    "temperature": 0.0      # loglikelihood 固定参数
+                }
             else:
-                # 其他格式，转为字符串
-                converted.append({
-                    "role": "user",
-                    "content": str(msg)
-                })
-        
-        return converted
+                # ========== 普通生成任务：使用用户配置 ==========
+                target_url = self.completions_url  # 使用 completions 接口，支持批量
+                
+                # 转换所有输入为prompts列表
+                prompts = []
+                for input_msgs in inputs:
+                    prompt = input_msgs if isinstance(input_msgs, str) else input_msgs[-1].content
+                    prompts.append(prompt)
+                
+                request_data = {
+                    "model": self.model_name,
+                    "prompt": prompts,
+                    "max_tokens": first_config.max_tokens,    # 使用用户配置
+                    "temperature": first_config.temperature,  # 使用用户配置
+                    "top_p": first_config.top_p              # 使用用户配置
+                }
+            
+            # 发送批量请求
+            response = self.session.post(target_url, json=request_data, timeout=self.timeout)
+            result = response.json()
+            
+            # 解析批量响应
+            choices = result.get("choices", [])
+            results = []
+            
+            for i, choice in enumerate(choices):
+                if "text" in choice:
+                    content = choice["text"]
+                else:
+                    content = choice.get("message", {}).get("content", "")
+                
+                results.append(ModelOutput(
+                    model=self.model_name,
+                    content=content,
+                    raw_response=result
+                ))
+            
+            successful_count = len([r for r in results if r.content])
+            logging.info(f"[batch_generate] 批量处理完成，成功: {successful_count}/{len(inputs)}")
+            
+            return results
+            
+        except Exception as e:
+            logging.error(f"[batch_generate] 批量请求失败，回退到并发模式: {e}")
+            return self._fallback_batch_generate(inputs, tools, tool_choices, configs, **kwargs)
 
     def __del__(self):
         """清理资源"""
