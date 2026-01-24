@@ -14,79 +14,72 @@ class DistributedDeepSeekAdapter(ModelAPI):
     """适配器：调用 api_inference.py 提供的分布式推理服务"""
     
     def __init__(self, model_name: str,
-                 base_url: str = "http://127.0.0.1:8888",  # 默认端口8888
+                 base_url: str = "http://127.0.0.1:8888",
                  api_key: Optional[str] = None,
                  config: GenerateConfig = GenerateConfig(),
                  **kwargs) -> None:
         super().__init__(model_name=model_name, base_url=base_url, api_key=api_key, config=config)
-        
-        # API服务地址
         self.api_url = base_url.rstrip('/')
         self.chat_completions_url = f"{self.api_url}/v1/chat/completions"
         self.completions_url = f"{self.api_url}/v1/completions"
-        
-        # HTTP客户端配置
         self.session = requests.Session()
-        self.timeout = kwargs.get('timeout', 300)  # 默认5分钟超时
-        
-        # 并发控制
+        self.timeout = kwargs.get('timeout', 300)
         self.max_workers = kwargs.get('max_workers', 8)
-        
-        logging.info(f"[DistributedDeepSeekAdapter] 初始化完成，API地址: {self.api_url}")
 
-    def generate(self, input: List[ChatMessage], 
-                 tools: List[ToolInfo] = None,
-                 tool_choice: ToolChoice = None,
+    def generate(self, input: Union[List[ChatMessage], str], 
                  config: GenerateConfig = None, 
                  **kwargs) -> ModelOutput:
-        """单条生成：调用 /v1/chat/completions"""
-        
-        # 使用传入的config或默认config
+        """
+        改进后的生成方法：支持文本生成和 Log-likelihood 提取
+        """
         gen_config = config or self.config
         
-        # 转换消息格式
-        messages = self._convert_chat_messages(input)
+        # 判断是否为 Log-likelihood 请求 (EvalScope 评测任务常带 logprobs 参数)
+        # 或者判断输入是否为纯字符串 (Completion 模式)
+        is_completion_mode = isinstance(input, str) or kwargs.get('logprobs') is not None
         
-        # 构建请求数据
-        request_data = {
-            "model": self.model_name,
-            "messages": messages,
-            "max_tokens": gen_config.max_tokens or 128,
-            "temperature": gen_config.temperature if gen_config.temperature is not None else 0.7,
-            "top_p": gen_config.top_p if gen_config.top_p is not None else 0.9
-        }
-        
-        # 添加其他生成参数
-        if hasattr(gen_config, 'repetition_penalty') and gen_config.repetition_penalty is not None:
-            request_data["repetition_penalty"] = gen_config.repetition_penalty
-        
+        if is_completion_mode:
+            # 走我们修复好的 /v1/completions 接口
+            prompt = input if isinstance(input, str) else input[-1].content
+            request_data = {
+                "model": self.model_name,
+                "prompt": prompt,
+                "max_tokens": gen_config.max_tokens or 1,
+                "temperature": gen_config.temperature or 0.0,
+                "logprobs": kwargs.get('logprobs', 1),
+                "echo": kwargs.get('echo', True) # 评测通常需要 echo
+            }
+            target_url = self.completions_url
+        else:
+            # 走标准的聊天接口
+            request_data = {
+                "model": self.model_name,
+                "messages": self._convert_chat_messages(input),
+                "max_tokens": gen_config.max_tokens or 128,
+                "temperature": gen_config.temperature or 0.7
+            }
+            target_url = self.chat_completions_url
+
         try:
-            logging.debug(f"[generate] 发送请求: {json.dumps(request_data, ensure_ascii=False)[:200]}...")
-            
-            response = self.session.post(
-                self.chat_completions_url,
-                json=request_data,
-                timeout=self.timeout
-            )
+            response = self.session.post(target_url, json=request_data, timeout=self.timeout)
             response.raise_for_status()
-            
             result = response.json()
-            content = result["choices"][0]["message"]["content"]
             
-            logging.debug(f"[generate] 收到响应: {content[:100]}...")
+            choice = result["choices"][0]
             
-            return ModelOutput.from_content(
+            # --- 核心改进：提取并透传 logprobs ---
+            # 如果 API 返回了 logprobs（包含我们修复的 tokens 和 token_logprobs），塞进 raw_response
+            # EvalScope 的 Evaluator 会从 raw_response 或 metadata 中读取它
+            model_output = ModelOutput(
                 model=self.model_name,
-                content=content
+                content=choice.get("text", choice.get("message", {}).get("content", "")),
+                raw_response=result  # 将整个 API 返回传给 EvalScope 进行解析
             )
+            return model_output
             
-        except requests.exceptions.RequestException as e:
-            logging.error(f"[generate] API请求失败: {e}")
-            return ModelOutput.from_content(
-                model=self.model_name,
-                content="",
-                error=str(e)
-            )
+        except Exception as e:
+            logging.error(f"[DistributedDeepSeekAdapter] 请求失败: {e}")
+            return ModelOutput(model=self.model_name, content="", error=str(e))
 
     def batch_generate(self, inputs: List[List[ChatMessage]], 
                       tools: List[List[ToolInfo]] = None,
