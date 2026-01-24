@@ -235,8 +235,42 @@ class DistributedInferenceEngine:
                     rid = req['id']; self.results[rid] = results[i]
                     if rid in self.events: self.events[rid].set()
 
+    # def _execute_loglikelihood_sync(self, input_ids, batch_size, p_args):
+    #     cont_len = int(p_args['cont_len'])
+    #     with torch.no_grad():
+    #         q_len = input_ids.shape[1]
+    #         padding_mask = (input_ids != self.tokenizer.pad_token_id).long().to("npu:0")
+    #         causal_mask = torch.triu(torch.full((q_len, q_len), float("-inf"), device="npu:0"), 1)
+    #         mask = causal_mask.view(1, 1, q_len, q_len) + (1.0 - padding_mask.view(batch_size, 1, 1, q_len).to(torch.bfloat16)) * -10000.0
+            
+    #         if self.args.node_rank == 0:
+    #             h = self.model.model.embed_tokens(input_ids)
+    #             for layer in self.model.model.layers: 
+    #                 h = layer(h.to(next(layer.parameters()).device), attention_mask=mask.to(next(layer.parameters()).device), use_cache=False)[0]
+    #             dist.send(tensor=h.to("npu:0").to(torch.bfloat16).contiguous(), dst=1)
+                
+    #             # 接收批次结果
+    #             # 注意：这里接收的是一个扁平化的 logprobs 矩阵 [batch, q_len-1]
+    #             logprobs_recv = torch.zeros((batch_size, q_len - 1), device="npu:0", dtype=torch.float32)
+    #             dist.recv(tensor=logprobs_recv, src=1)
+    #             return logprobs_recv.tolist() # 返回给 API 解析
+    #         else:
+    #             h_recv = torch.zeros((batch_size, q_len, self.model.config.hidden_size), dtype=torch.bfloat16, device="npu:0")
+    #             dist.recv(tensor=h_recv, src=0); h = h_recv
+    #             for layer in self.model.model.layers: 
+    #                 h = layer(h.to(next(layer.parameters()).device), attention_mask=mask.to(next(layer.parameters()).device), use_cache=False)[0]
+    #             logits = self.model.lm_head(self.model.model.norm(h.to(next(self.model.lm_head.parameters()).device)))
+    #             logprobs = F.log_softmax(logits, dim=-1)
+                
+    #             # 提取目标的 logprobs
+    #             target_ids = input_ids[:, 1:].unsqueeze(-1).to(logprobs.device)
+    #             relevant_logprobs = logprobs[:, :-1, :].gather(-1, target_ids).squeeze(-1) # [batch, q_len-1]
+                
+    #             dist.send(tensor=relevant_logprobs.to("npu:0").to(torch.float32).contiguous(), dst=0)
+    #             return relevant_logprobs.tolist()
+    
+    # 修改 loglikelihood 接口
     def _execute_loglikelihood_sync(self, input_ids, batch_size, p_args):
-        cont_len = int(p_args['cont_len'])
         with torch.no_grad():
             q_len = input_ids.shape[1]
             padding_mask = (input_ids != self.tokenizer.pad_token_id).long().to("npu:0")
@@ -249,25 +283,31 @@ class DistributedInferenceEngine:
                     h = layer(h.to(next(layer.parameters()).device), attention_mask=mask.to(next(layer.parameters()).device), use_cache=False)[0]
                 dist.send(tensor=h.to("npu:0").to(torch.bfloat16).contiguous(), dst=1)
                 
-                # 接收批次结果
-                # 注意：这里接收的是一个扁平化的 logprobs 矩阵 [batch, q_len-1]
-                logprobs_recv = torch.zeros((batch_size, q_len - 1), device="npu:0", dtype=torch.float32)
+                # 接收批次结果：[batch, q_len]
+                logprobs_recv = torch.zeros((batch_size, q_len), device="npu:0", dtype=torch.float32)
                 dist.recv(tensor=logprobs_recv, src=1)
-                return logprobs_recv.tolist() # 返回给 API 解析
+                return logprobs_recv.tolist()
             else:
                 h_recv = torch.zeros((batch_size, q_len, self.model.config.hidden_size), dtype=torch.bfloat16, device="npu:0")
                 dist.recv(tensor=h_recv, src=0); h = h_recv
                 for layer in self.model.model.layers: 
                     h = layer(h.to(next(layer.parameters()).device), attention_mask=mask.to(next(layer.parameters()).device), use_cache=False)[0]
-                logits = self.model.lm_head(self.model.model.norm(h.to(next(self.model.lm_head.parameters()).device)))
-                logprobs = F.log_softmax(logits, dim=-1)
                 
-                # 提取目标的 logprobs
+                logits = self.model.lm_head(self.model.model.norm(h.to(next(self.model.lm_head.parameters()).device)))
+                
+                # --- 核心改进：强制 float32 提高选择精度 ---
+                logprobs = F.log_softmax(logits.float(), dim=-1)
+                
+                # --- 核心改进：索引对齐 ---
                 target_ids = input_ids[:, 1:].unsqueeze(-1).to(logprobs.device)
                 relevant_logprobs = logprobs[:, :-1, :].gather(-1, target_ids).squeeze(-1) # [batch, q_len-1]
                 
-                dist.send(tensor=relevant_logprobs.to("npu:0").to(torch.float32).contiguous(), dst=0)
-                return relevant_logprobs.tolist()
+                # 在第0位补0，使长度与 input_ids 一致
+                padding_val = torch.zeros((batch_size, 1), device="npu:0", dtype=relevant_logprobs.dtype)
+                final_logprobs = torch.cat([padding_val, relevant_logprobs], dim=-1)
+                
+                dist.send(tensor=final_logprobs.to("npu:0").to(torch.float32).contiguous(), dst=0)
+                return final_logprobs.tolist()
 
     def _execute_inference_sync(self, input_ids, batch_size, p_args):
         batch_ids = input_ids.tolist(); past_key_values = DynamicCache(); curr_input_ids = input_ids
@@ -315,74 +355,166 @@ app = FastAPI()
 class ChatCompletionRequest(BaseModel): model: str = "deepseek-v3-tucker"; messages: List[Dict]; max_tokens: int = 128; temperature: float = 0.7; top_p: float = 0.9
 class CompletionRequest(BaseModel): model: str = "deepseek-v3-tucker"; prompt: Union[str, List[str]]; max_tokens: int = 128; temperature: float = 0.0; top_p: float = 1.0; logprobs: Optional[int] = None; echo: bool = False
 
+# @app.post("/v1/chat/completions")
+# async def chat_completions(request: ChatCompletionRequest):
+#     req_id = str(uuid.uuid4()); event = asyncio.Event(); engine.events[req_id] = event
+#     formatted_prompt = engine.tokenizer.apply_chat_template(request.messages, tokenize=False, add_generation_prompt=True)
+#     await engine.req_queue.put({"type": "chat", "id": req_id, "prompt": formatted_prompt, "max_tokens": request.max_tokens, "temp": request.temperature, "top_p": request.top_p})
+#     await event.wait(); res = engine.results.pop(req_id); del engine.events[req_id]
+#     return {"id": req_id, "object": "chat.completion", "choices": [{"message": {"role": "assistant", "content": res}, "index": 0, "finish_reason": "stop"}]}
+
+# @app.post("/v1/completions")
+# async def completions(request: CompletionRequest):
+#     req_id_base = str(uuid.uuid4())
+#     prompts = [request.prompt] if isinstance(request.prompt, str) else request.prompt
+#     is_ll = (request.logprobs is not None and request.logprobs > 0)
+    
+#     events, results_ids = [], []
+#     for i, p in enumerate(prompts):
+#         rid = f"{req_id_base}-{i}"
+#         ev = asyncio.Event()
+#         engine.events[rid] = ev
+#         events.append(ev)
+#         results_ids.append(rid)
+#         # 默认 cont_len 取全长度以兼容 loglikelihood
+#         await engine.req_queue.put({
+#             "type": "loglikelihood" if is_ll else "chat", 
+#             "id": rid, 
+#             "prompt": p, 
+#             "max_tokens": request.max_tokens, 
+#             "temp": request.temperature, 
+#             "top_p": request.top_p, 
+#             "cont_len": 2048 # 默认上限
+#         })
+    
+#     # 等待所有并发请求完成
+#     await asyncio.gather(*(ev.wait() for ev in events))
+    
+#     choices = []
+#     for i, rid in enumerate(results_ids):
+#         # 从结果池中获取推理结果
+#         res = engine.results.pop(rid)
+#         del engine.events[rid]
+        
+#         if is_ll:
+#             # 这里的 res 是 List[float]，代表序列中每个 token 的 logprobs
+#             # 为了修复 max() 报错，top_logprobs 必须包含实际的数值字典
+#             choices.append({
+#                 "text": prompts[i] if request.echo else "", 
+#                 "index": i, 
+#                 "logprobs": {
+#                     "token_logprobs": res, 
+#                     "tokens": ["<token>"] * len(res), 
+#                     # 将每一个 token 的概率放入字典，防止客户端 max(top.values()) 报错
+#                     "top_logprobs": [{"<token>": val} for val in res] 
+#                 }, 
+#                 "finish_reason": "stop"
+#             })
+#         else:
+#             # 普通生成任务返回文本结果
+#             choices.append({
+#                 "text": res, 
+#                 "index": i, 
+#                 "finish_reason": "stop"
+#             })
+            
+#     return {
+#         "id": req_id_base, 
+#         "object": "text_completion", 
+#         "choices": choices
+#     }
+
+# 修改 chat_completions 接口
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest):
     req_id = str(uuid.uuid4()); event = asyncio.Event(); engine.events[req_id] = event
-    formatted_prompt = engine.tokenizer.apply_chat_template(request.messages, tokenize=False, add_generation_prompt=True)
-    await engine.req_queue.put({"type": "chat", "id": req_id, "prompt": formatted_prompt, "max_tokens": request.max_tokens, "temp": request.temperature, "top_p": request.top_p})
-    await event.wait(); res = engine.results.pop(req_id); del engine.events[req_id]
-    return {"id": req_id, "object": "chat.completion", "choices": [{"message": {"role": "assistant", "content": res}, "index": 0, "finish_reason": "stop"}]}
 
+    formatted_prompt = ""
+    for msg in request.messages:
+        formatted_prompt += f"{msg['role']}: {msg['content']}\n"
+    # 如果你连 "user: " 这种前缀都不要，可以直接取最后一条：
+    # formatted_prompt = request.messages[-1]['content']
+    
+    await engine.req_queue.put({
+        "type": "chat", 
+        "id": req_id, 
+        "prompt": formatted_prompt, 
+        "max_tokens": request.max_tokens, 
+        "temp": request.temperature, 
+        "top_p": request.top_p
+    })
+    await event.wait(); res = engine.results.pop(req_id); del engine.events[req_id]
+    
+    return {
+        "id": req_id, 
+        "object": "chat.completion", 
+        "choices": [{
+            "message": {"role": "assistant", "content": res}, 
+            "index": 0, 
+            "finish_reason": "stop"
+        }]
+    }
+    
+    
+# 修改 completions 接口
 @app.post("/v1/completions")
 async def completions(request: CompletionRequest):
     req_id_base = str(uuid.uuid4())
     prompts = [request.prompt] if isinstance(request.prompt, str) else request.prompt
     is_ll = (request.logprobs is not None and request.logprobs > 0)
     
+    # 提前编码以获取 input_ids 用于 token 还原
+    encoded = engine.tokenizer(prompts, padding=True, return_tensors="pt")
+    all_input_ids = encoded.input_ids
+
     events, results_ids = [], []
     for i, p in enumerate(prompts):
         rid = f"{req_id_base}-{i}"
-        ev = asyncio.Event()
-        engine.events[rid] = ev
-        events.append(ev)
-        results_ids.append(rid)
-        # 默认 cont_len 取全长度以兼容 loglikelihood
+        ev = asyncio.Event(); engine.events[rid] = ev
+        events.append(ev); results_ids.append(rid)
         await engine.req_queue.put({
             "type": "loglikelihood" if is_ll else "chat", 
-            "id": rid, 
-            "prompt": p, 
+            "id": rid, "prompt": p, 
             "max_tokens": request.max_tokens, 
-            "temp": request.temperature, 
-            "top_p": request.top_p, 
-            "cont_len": 2048 # 默认上限
+            "temp": request.temperature, "top_p": request.top_p, 
+            "cont_len": 2048
         })
     
-    # 等待所有并发请求完成
     await asyncio.gather(*(ev.wait() for ev in events))
     
     choices = []
     for i, rid in enumerate(results_ids):
-        # 从结果池中获取推理结果
         res = engine.results.pop(rid)
         del engine.events[rid]
         
         if is_ll:
-            # 这里的 res 是 List[float]，代表序列中每个 token 的 logprobs
-            # 为了修复 max() 报错，top_logprobs 必须包含实际的数值字典
+            # --- 核心改进：Token 还原与 Padding 过滤 ---
+            token_ids = all_input_ids[i]
+            tokens_str = engine.tokenizer.convert_ids_to_tokens(token_ids)
+            
+            # 找到第一个非 pad token
+            first_valid = (token_ids != engine.tokenizer.pad_token_id).long().argmax().item()
+            
+            valid_tokens = tokens_str[first_valid:]
+            valid_logprobs = res[first_valid:]
+            
+            # 格式化 top_logprobs
+            top_lp = [{t: lp} for t, lp in zip(valid_tokens, valid_logprobs)]
+
             choices.append({
                 "text": prompts[i] if request.echo else "", 
                 "index": i, 
                 "logprobs": {
-                    "token_logprobs": res, 
-                    "tokens": ["<token>"] * len(res), 
-                    # 将每一个 token 的概率放入字典，防止客户端 max(top.values()) 报错
-                    "top_logprobs": [{"<token>": val} for val in res] 
+                    "token_logprobs": valid_logprobs, 
+                    "tokens": valid_tokens, 
+                    "top_logprobs": top_lp
                 }, 
                 "finish_reason": "stop"
             })
         else:
-            # 普通生成任务返回文本结果
-            choices.append({
-                "text": res, 
-                "index": i, 
-                "finish_reason": "stop"
-            })
+            choices.append({"text": res, "index": i, "finish_reason": "stop"})
             
-    return {
-        "id": req_id_base, 
-        "object": "text_completion", 
-        "choices": choices
-    }
+    return {"id": req_id_base, "object": "text_completion", "choices": choices}
 
 def main():
     parser = argparse.ArgumentParser()

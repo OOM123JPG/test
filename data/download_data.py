@@ -7,7 +7,7 @@ os.makedirs(save_path, exist_ok=True)
 
 # 下载数据集到指定目录
 ds = MsDataset.load(
-    'AI-ModelScope/winogrande_val',
+    'allenai/ai2_arc',
     subset_name='default',
     split='validation',
     cache_dir=save_path
