@@ -14,6 +14,7 @@ import queue
 import threading
 from datetime import timedelta
 from typing import List, Dict, Any, Union, Optional
+from concurrent.futures import ThreadPoolExecutor  # <-- 补齐了这里
 from fastapi import FastAPI
 from pydantic import BaseModel
 import uvicorn
@@ -23,7 +24,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.cache_utils import DynamicCache
 
 # ==========================================
-# 0. 日志与全局变量
+# 0. 日志与全局跨线程变量
 # ==========================================
 logging.basicConfig(
     level=logging.INFO, 
@@ -32,7 +33,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-main_loop = None  # 记录 FastAPI 的事件循环，用于跨线程唤醒
+main_loop = None  # 用于存储 FastAPI 的 asyncio loop 引用
 
 # ==========================================
 # 1. Tucker 组件
@@ -93,7 +94,7 @@ class DistributedInferenceEngine:
         self.args = args
         self.model = None
         self.tokenizer = None
-        self.req_queue = queue.Queue() # 使用线程安全队列
+        self.req_queue = queue.Queue() # 线程安全队列
         self.results = {}
         self.events = {}
         self.is_running = True
@@ -125,7 +126,7 @@ class DistributedInferenceEngine:
 
     def _pipeline_surgery_and_loading(self):
         num_layers = len(self.model.model.layers)
-        RESERVED, main_npu = 8, "npu:0" # 严格保持 8GB
+        RESERVED, main_npu = 8, "npu:0" 
         
         def surgery_task(idx_in_module, layer):
             real_idx = self.start_idx + idx_in_module
@@ -190,20 +191,19 @@ class DistributedInferenceEngine:
         executor.shutdown(wait=True); gc.collect(); torch.npu.empty_cache()
 
     async def run_loop(self):
-        """此循环将在后台线程的事件循环中运行"""
+        """在后台线程的事件循环中运行推理"""
         while self.is_running:
             active_reqs = []
             if self.args.node_rank == 0:
                 try:
-                    # 从线程安全队列中获取任务
+                    # 获取主线程塞进来的任务
                     req = self.req_queue.get_nowait()
                     active_reqs.append(req)
-                    while not self.req_queue.empty() and len(active_reqs) < 16: 
+                    while not self.req_queue.empty() and len(active_reqs) < 16:
                         active_reqs.append(self.req_queue.get_nowait())
                 except queue.Empty:
-                    # 无任务，通知 Rank 1 继续等待，注意这是同步阻塞操作
                     dist.broadcast(torch.tensor([0], dtype=torch.long, device="npu:0"), src=0)
-                    await asyncio.sleep(0.01) # 避免 CPU 空转
+                    await asyncio.sleep(0.01)
                     continue
 
                 dist.broadcast(torch.tensor([len(active_reqs)], dtype=torch.long, device="npu:0"), src=0)
@@ -219,30 +219,26 @@ class DistributedInferenceEngine:
             else:
                 signal = torch.zeros([1], dtype=torch.long, device="npu:0")
                 dist.broadcast(signal, src=0)
-                if signal.item() == 0: 
+                if signal.item() == 0:
                     await asyncio.sleep(0.01)
                     continue
                 batch_size = int(signal.item())
-                params = torch.zeros([5], device="npu:0")
-                dist.broadcast(params, src=0)
+                params = torch.zeros([5], device="npu:0"); dist.broadcast(params, src=0)
                 task_code, p_max, p_temp, p_top, p_cont = params.tolist()
                 p_args = {'max_tokens': int(p_max), 'temp': p_temp, 'top_p': p_top, 'cont_len': int(p_cont)}
-                seq_len_t = torch.zeros([1], dtype=torch.long, device="npu:0")
-                dist.broadcast(seq_len_t, src=0)
+                seq_len_t = torch.zeros([1], dtype=torch.long, device="npu:0"); dist.broadcast(seq_len_t, src=0)
                 input_ids = torch.zeros((batch_size, int(seq_len_t.item())), dtype=torch.long, device="npu:0")
                 dist.broadcast(input_ids, src=0)
 
-            # 推理阶段 (同步阻塞)
-            if task_code == 1: 
-                results = self._execute_loglikelihood_sync(input_ids, len(input_ids), p_args)
-            else: 
-                results = self._execute_inference_sync(input_ids, len(input_ids), p_args)
+            # 推理同步阻塞计算
+            if task_code == 1: results = self._execute_loglikelihood_sync(input_ids, len(input_ids), p_args)
+            else: results = self._execute_inference_sync(input_ids, len(input_ids), p_args)
             
             if self.args.node_rank == 0:
                 for i, req in enumerate(active_reqs):
                     rid = req['id']
                     self.results[rid] = results[i]
-                    # 关键：跨线程安全地唤醒主线程的 asyncio.Event
+                    # 跨线程拍醒 FastAPI
                     if rid in self.events:
                         main_loop.call_soon_threadsafe(self.events[rid].set)
 
@@ -252,28 +248,23 @@ class DistributedInferenceEngine:
             padding_mask = (input_ids != self.tokenizer.pad_token_id).long().to("npu:0")
             causal_mask = torch.triu(torch.full((q_len, q_len), float("-inf"), device="npu:0"), 1)
             mask = causal_mask.view(1, 1, q_len, q_len) + (1.0 - padding_mask.view(batch_size, 1, 1, q_len).to(torch.bfloat16)) * -10000.0
-            
             if self.args.node_rank == 0:
                 h = self.model.model.embed_tokens(input_ids)
-                for layer in self.model.model.layers: 
-                    h = layer(h.to(next(layer.parameters()).device), attention_mask=mask.to(next(layer.parameters()).device), use_cache=False)[0]
+                for layer in self.model.model.layers: h = layer(h.to(next(layer.parameters()).device), attention_mask=mask.to(next(layer.parameters()).device), use_cache=False)[0]
                 dist.send(tensor=h.to("npu:0").to(torch.bfloat16).contiguous(), dst=1)
                 logprobs_recv = torch.zeros((batch_size, q_len), device="npu:0", dtype=torch.float32)
-                dist.recv(tensor=logprobs_recv, src=1)
-                return logprobs_recv.tolist()
+                dist.recv(tensor=logprobs_recv, src=1); return logprobs_recv.tolist()
             else:
                 h_recv = torch.zeros((batch_size, q_len, self.model.config.hidden_size), dtype=torch.bfloat16, device="npu:0")
                 dist.recv(tensor=h_recv, src=0); h = h_recv
-                for layer in self.model.model.layers: 
-                    h = layer(h.to(next(layer.parameters()).device), attention_mask=mask.to(next(layer.parameters()).device), use_cache=False)[0]
+                for layer in self.model.model.layers: h = layer(h.to(next(layer.parameters()).device), attention_mask=mask.to(next(layer.parameters()).device), use_cache=False)[0]
                 logits = self.model.lm_head(self.model.model.norm(h.to(next(self.model.lm_head.parameters()).device)))
                 logprobs = F.log_softmax(logits.float(), dim=-1)
                 target_ids = input_ids[:, 1:].unsqueeze(-1).to(logprobs.device)
                 relevant_logprobs = logprobs[:, :-1, :].gather(-1, target_ids).squeeze(-1) 
                 padding_val = relevant_logprobs.new_zeros((batch_size, 1))
                 final_logprobs = torch.cat([padding_val, relevant_logprobs], dim=-1)
-                dist.send(tensor=final_logprobs.to("npu:0").to(torch.float32).contiguous(), dst=0)
-                return final_logprobs.tolist()
+                dist.send(tensor=final_logprobs.to("npu:0").to(torch.float32).contiguous(), dst=0); return final_logprobs.tolist()
 
     def _execute_inference_sync(self, input_ids, batch_size, p_args):
         batch_ids = input_ids.tolist(); past_key_values = DynamicCache(); curr_input_ids = input_ids
@@ -284,11 +275,10 @@ class DistributedInferenceEngine:
         with torch.no_grad():
             for step in range(max_gen):
                 is_prefill = (step == 0)
-                q_len = curr_input_ids.shape[1]
                 total_len = len(batch_ids[0])
                 if is_prefill:
-                    causal_mask = torch.triu(torch.full((q_len, q_len), float("-inf"), device="npu:0"), 1)
-                    mask = causal_mask.view(1, 1, q_len, q_len) + (1.0 - current_mask.view(batch_size, 1, 1, q_len).to(torch.bfloat16)) * -10000.0
+                    causal_mask = torch.triu(torch.full((curr_input_ids.shape[1], curr_input_ids.shape[1]), float("-inf"), device="npu:0"), 1)
+                    mask = causal_mask.view(1, 1, -1, -1) + (1.0 - current_mask.view(batch_size, 1, 1, -1).to(torch.bfloat16)) * -10000.0
                 else: mask = (1.0 - current_mask.view(batch_size, 1, 1, total_len).to(torch.bfloat16)) * -10000.0
                 
                 if self.args.node_rank == 0:
@@ -297,7 +287,7 @@ class DistributedInferenceEngine:
                     dist.send(tensor=h.to("npu:0").to(torch.bfloat16).contiguous(), dst=1)
                     new_ids_dev = torch.zeros((batch_size, 1), dtype=torch.long, device="npu:0"); dist.recv(tensor=new_ids_dev, src=1); curr_input_ids = new_ids_dev
                 else:
-                    h_recv = torch.zeros((batch_size, q_len, self.model.config.hidden_size), dtype=torch.bfloat16, device="npu:0"); dist.recv(tensor=h_recv, src=0); h = h_recv
+                    h_recv = torch.zeros((batch_size, curr_input_ids.shape[1], self.model.config.hidden_size), dtype=torch.bfloat16, device="npu:0"); dist.recv(tensor=h_recv, src=0); h = h_recv
                     for layer in self.model.model.layers: h = layer(h.to(next(layer.parameters()).device), attention_mask=mask.to(next(layer.parameters()).device), position_ids=position_ids.to(next(layer.parameters()).device), past_key_value=past_key_values, use_cache=True)[0]
                     logits = self.model.lm_head(self.model.model.norm(h.to(next(self.model.lm_head.parameters()).device)))[:, -1, :]
                     logits = apply_sampling(logits, p_args['temp'], p_args['top_p'], 1.1, batch_ids)
@@ -324,44 +314,31 @@ class CompletionRequest(BaseModel): model: str = "deepseek-v3-tucker"; prompt: U
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest):
-    req_id, event = str(uuid.uuid4()), asyncio.Event()
-    engine.events[req_id] = event
-    formatted_prompt = "".join([f"{msg['role']}: {msg['content']}\n" for msg in request.messages]) + "assistant: "
-    
-    engine.req_queue.put({"type": "chat", "id": req_id, "prompt": formatted_prompt, "max_tokens": request.max_tokens, "temp": request.temperature, "top_p": request.top_p})
+    req_id, event = str(uuid.uuid4()), asyncio.Event(); engine.events[req_id] = event
+    prompt = "".join([f"{msg['role']}: {msg['content']}\n" for msg in request.messages]) + "assistant: "
+    engine.req_queue.put({"type": "chat", "id": req_id, "prompt": prompt, "max_tokens": request.max_tokens, "temp": request.temperature, "top_p": request.top_p})
     await event.wait(); res = engine.results.pop(req_id); del engine.events[req_id]
     return {"id": req_id, "object": "chat.completion", "choices": [{"message": {"role": "assistant", "content": res}, "index": 0, "finish_reason": "stop"}]}
 
 @app.post("/v1/completions")
 async def completions(request: CompletionRequest):
-    req_id_base = str(uuid.uuid4())
-    prompts = [request.prompt] if isinstance(request.prompt, str) else request.prompt
+    req_id_base = str(uuid.uuid4()); prompts = [request.prompt] if isinstance(request.prompt, str) else request.prompt
     is_ll = (request.logprobs is not None and request.logprobs > 0)
-    encoded = engine.tokenizer(prompts, padding=True, return_tensors="pt")
-    all_input_ids = encoded.input_ids 
-
+    encoded = engine.tokenizer(prompts, padding=True, return_tensors="pt"); all_input_ids = encoded.input_ids 
     events, results_ids = [], []
     for i, p in enumerate(prompts):
-        rid, ev = f"{req_id_base}-{i}", asyncio.Event()
-        engine.events[rid] = ev
+        rid, ev = f"{req_id_base}-{i}", asyncio.Event(); engine.events[rid] = ev
         events.append(ev); results_ids.append(rid)
         engine.req_queue.put({"type": "loglikelihood" if is_ll else "chat", "id": rid, "prompt": p, "max_tokens": request.max_tokens, "temp": request.temperature, "top_p": request.top_p, "cont_len": 2048})
-    
     await asyncio.gather(*(ev.wait() for ev in events))
     choices = []
     for i, rid in enumerate(results_ids):
         res = engine.results.pop(rid); del engine.events[rid]
         if is_ll:
-            token_ids = all_input_ids[i]
-            tokens_str = engine.tokenizer.convert_ids_to_tokens(token_ids)
+            token_ids = all_input_ids[i]; tokens_str = engine.tokenizer.convert_ids_to_tokens(token_ids)
             first_valid = (token_ids != engine.tokenizer.pad_token_id).long().argmax().item()
             valid_tokens, valid_logprobs = tokens_str[first_valid:], res[first_valid:]
-            choices.append({
-                "text": prompts[i] if request.echo else "", "index": i, 
-                "logprobs": {"token_logprobs": valid_logprobs, "tokens": valid_tokens, "top_logprobs": [{t: lp} for t, lp in zip(valid_tokens, valid_logprobs)]}, 
-                "message": {"role": "assistant", "content": ""}, # 兼容性补丁
-                "finish_reason": "stop"
-            })
+            choices.append({"text": prompts[i] if request.echo else "", "index": i, "logprobs": {"token_logprobs": valid_logprobs, "tokens": valid_tokens, "top_logprobs": [{t: lp} for t, lp in zip(valid_tokens, valid_logprobs)]}, "message": {"role": "assistant", "content": ""}, "finish_reason": "stop"})
         else:
             choices.append({"text": res, "index": i, "finish_reason": "stop", "message": {"role": "assistant", "content": res}})
     return {"id": req_id_base, "object": "text_completion", "choices": choices}
