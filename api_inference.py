@@ -517,6 +517,13 @@ async def completions(request: CompletionRequest):
             
     return {"id": req_id_base, "object": "text_completion", "choices": choices}
 
+
+@app.on_event("startup")
+async def startup_event():
+    # 在同一个 Loop 中启动推理循环
+    asyncio.create_task(engine.run_loop())
+    
+    
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_path", type=str, required=True); parser.add_argument("--whitening_dir", type=str, required=True)
@@ -527,11 +534,17 @@ def main():
     os.environ['HCCL_CONNECT_TIMEOUT'] = '7200'; os.environ['HCCL_EXEC_TIMEOUT'] = '7200'
     os.environ['PYTORCH_NPU_ALLOC_CONF'] = 'max_split_size_mb:128'
     global engine; engine = DistributedInferenceEngine(args); engine.setup()
+    # if args.node_rank == 0:
+    #     import threading
+    #     def run_e(): loop = asyncio.new_event_loop(); asyncio.set_event_loop(loop); loop.run_until_complete(engine.run_loop())
+    #     threading.Thread(target=run_e, daemon=True).start()
+    #     uvicorn.run(app, host="0.0.0.0", port=args.port)
+    # else: asyncio.run(engine.run_loop())
+
     if args.node_rank == 0:
-        import threading
-        def run_e(): loop = asyncio.new_event_loop(); asyncio.set_event_loop(loop); loop.run_until_complete(engine.run_loop())
-        threading.Thread(target=run_e, daemon=True).start()
         uvicorn.run(app, host="0.0.0.0", port=args.port)
-    else: asyncio.run(engine.run_loop())
+    else:
+        asyncio.run(engine.run_loop())
+
 
 if __name__ == "__main__": main()
