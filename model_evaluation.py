@@ -3,7 +3,7 @@ import json
 from evalscope.run import run_task
 from evalscope.config import TaskConfig
 
-# 重要：导入自定义适配器，确保它被注册
+# 重要：导入自定义适配器
 from model_adapter import DistributedDeepSeekAdapter
 
 # 设置工作目录
@@ -12,16 +12,23 @@ os.makedirs(work_dir_base, exist_ok=True)
 print("Evaluation results will be saved to:", work_dir_base)
 
 def run_winogrande_evaluation():
-    """运行Winogrande评测"""
+    """运行Winogrande评测 - 使用本地数据集"""
     print("\n" + "="*50)
-    print(">>> 开始评测 Winogrande")
+    print(">>> 开始评测 Winogrande (本地数据集)")
     print("="*50)
     
     task_cfg = TaskConfig(
-        model='deepseek-v3-tucker',  # 模型名称
-        eval_type='distributed_deepseek',  # 使用自定义适配器
-        api_url='http://127.0.0.1:8888',   # 传递给适配器的参数
+        model='deepseek-v3-tucker',
+        eval_type='distributed_deepseek',
+        api_url='http://127.0.0.1:8888',
         datasets=['winogrande'],
+        # 通过dataset_args指定本地数据集路径
+        dataset_args={
+            'winogrande': {
+                'local_path': '/path/to/your/local/winogrande/dataset',  # 本地数据集路径
+                'subset_list': ['validation']  # 指定要评测的子集
+            }
+        },
         generation_config={
             'max_tokens': 5,
             'temperature': 0.0,
@@ -49,9 +56,9 @@ def run_winogrande_evaluation():
         print(f"✗ Winogrande evaluation failed: {e}")
 
 def run_piqa_evaluation():
-    """运行PIQA评测"""
+    """运行PIQA评测 - 使用本地数据集"""
     print("\n" + "="*50)
-    print(">>> 开始评测 PIQA")
+    print(">>> 开始评测 PIQA (本地数据集)")
     print("="*50)
     
     task_cfg = TaskConfig(
@@ -59,6 +66,12 @@ def run_piqa_evaluation():
         eval_type='distributed_deepseek',
         api_url='http://127.0.0.1:8888',
         datasets=['piqa'],
+        dataset_args={
+            'piqa': {
+                'local_path': '/path/to/your/local/piqa/dataset',
+                'subset_list': ['validation']
+            }
+        },
         generation_config={
             'max_tokens': 5,
             'temperature': 0.0,
@@ -74,7 +87,6 @@ def run_piqa_evaluation():
         run_task(task_cfg)
         print("✓ PIQA evaluation completed successfully")
         
-        # 读取结果
         report_path = os.path.join(work_dir_base, 'piqa', 'reports', 'deepseek-v3-tucker', 'piqa.json')
         if os.path.exists(report_path):
             with open(report_path, 'r') as f:
@@ -86,13 +98,13 @@ def run_piqa_evaluation():
         print(f"✗ PIQA evaluation failed: {e}")
 
 def run_arc_evaluation():
-    """运行ARC评测（Easy和Challenge）"""
+    """运行ARC评测 - 使用本地数据集"""
     print("\n" + "="*50)
-    print(">>> 开始评测 ARC")
+    print(">>> 开始评测 ARC (本地数据集)")
     print("="*50)
     
-    for arc_type in ['ARC-Easy', 'ARC-Challenge']:
-        print(f"\n>>> 评测 {arc_type}")
+    for arc_type, arc_name in [('ARC-Easy', 'ARC-Easy'), ('ARC-Challenge', 'ARC-Challenge')]:
+        print(f"\n>>> 评测 {arc_name}")
         
         task_cfg = TaskConfig(
             model='deepseek-v3-tucker', 
@@ -101,8 +113,9 @@ def run_arc_evaluation():
             datasets=['arc'],
             dataset_args={
                 'arc': {
+                    'local_path': f'/path/to/your/local/arc/{arc_type.lower().replace("-", "_")}/dataset',
                     'subset_list': [arc_type]
-                },
+                }
             },
             generation_config={
                 'max_tokens': 256,
@@ -117,39 +130,33 @@ def run_arc_evaluation():
         
         try:
             run_task(task_cfg)
-            print(f"✓ {arc_type} evaluation completed successfully")
+            print(f"✓ {arc_name} evaluation completed successfully")
             
-            # 读取结果
             report_path = os.path.join(work_dir_base, f'arc_{arc_type.lower().replace("-", "_")}', 
                                      'reports', 'deepseek-v3-tucker', 'arc.json')
             if os.path.exists(report_path):
                 with open(report_path, 'r') as f:
                     data = json.load(f)
                     acc = data.get('results', [{}])[0].get('score', 'N/A')
-                    print(f"{arc_type} 准确率: {acc}")
+                    print(f"{arc_name} 准确率: {acc}")
                     
         except Exception as e:
-            print(f"✗ {arc_type} evaluation failed: {e}")
+            print(f"✗ {arc_name} evaluation failed: {e}")
 
 def run_mmlu_evaluation():
-    """运行MMLU评测"""
+    """运行MMLU评测 - 使用本地数据集"""
     print("\n" + "="*50)
-    print(">>> 开始评测 MMLU")
+    print(">>> 开始评测 MMLU (本地数据集)")
     print("="*50)
     
-    # MMLU子集列表
-    mmlu_subsets = [
-        'astronomy', 'college_biology', 'college_chemistry', 
-        'college_computer_science', 'college_mathematics', 'college_physics', 
-        'computer_security', 'high_school_mathematics', 'high_school_physics'
-    ]
+    mmlu_subjects = ['astronomy', 'college_biology', 'college_chemistry']
     
-    print(f">>> 将评测以下 {len(mmlu_subsets)} 个 MMLU 子集: {', '.join(mmlu_subsets)}")
+    print(f">>> 将评测以下 {len(mmlu_subjects)} 个 MMLU 子集: {', '.join(mmlu_subjects)}")
     
-    for subset in mmlu_subsets:
-        print(f"\n>>> 评测子集: {subset}")
+    for subject in mmlu_subjects:
+        print(f"\n>>> 评测子集: {subject}")
         
-        subset_work_dir = os.path.join(work_dir_base, 'mmlu', subset)
+        subject_work_dir = os.path.join(work_dir_base, 'mmlu', subject)
         
         task_cfg = TaskConfig(
             model='deepseek-v3-tucker', 
@@ -158,8 +165,9 @@ def run_mmlu_evaluation():
             datasets=['mmlu'],
             dataset_args={
                 'mmlu': {
-                    'subset_list': [subset]
-                },
+                    'local_path': f'/path/to/your/local/mmlu/{subject}/dataset',
+                    'subset_list': [subject]
+                }
             },
             generation_config={
                 'max_tokens': 256,
@@ -168,43 +176,39 @@ def run_mmlu_evaluation():
             no_timestamp=True,
             eval_batch_size=4,
             limit=50,
-            work_dir=subset_work_dir,
-            use_cache=subset_work_dir
+            work_dir=subject_work_dir,
+            use_cache=subject_work_dir
         )
         
         try:
             run_task(task_cfg)
-            print(f"✓ 子集 {subset} 评测完成")
+            print(f"✓ 子集 {subject} 评测完成")
             
-            # 读取结果
-            report_path = os.path.join(subset_work_dir, 'reports', 'deepseek-v3-tucker', 'mmlu.json')
+            report_path = os.path.join(subject_work_dir, 'reports', 'deepseek-v3-tucker', 'mmlu.json')
             if os.path.exists(report_path):
                 with open(report_path, 'r') as f:
                     data = json.load(f)
                     acc = data.get('results', [{}])[0].get('score', 'N/A')
-                    print(f"{subset} 准确率: {acc}")
+                    print(f"{subject} 准确率: {acc}")
                     
         except Exception as e:
-            print(f"✗ 子集 {subset} 运行失败: {e}")
+            print(f"✗ 子集 {subject} 运行失败: {e}")
             continue
     
     print("\n>>> 所有 MMLU 子集评测循环结束！")
 
 def run_ceval_evaluation():
-    """运行CEval评测"""
+    """运行CEval评测 - 使用本地数据集"""
     print("\n" + "="*50)
-    print(">>> 开始评测 CEval")
+    print(">>> 开始评测 CEval (本地数据集)")
     print("="*50)
     
-    stem_subsets = [
-        "computer_network", "operating_system", "college_programming", 
-        "college_physics", "high_school_mathematics", "high_school_physics"
-    ]
+    ceval_subjects = ['computer_network', 'college_physics']
     
-    print(f">>> 将评测以下 {len(stem_subsets)} 个 CEval 子集: {', '.join(stem_subsets)}")
+    print(f">>> 将评测以下 {len(ceval_subjects)} 个 CEval 子集: {', '.join(ceval_subjects)}")
     
-    for subset in stem_subsets:
-        print(f"\n>>> 评测子集: {subset}")
+    for subject in ceval_subjects:
+        print(f"\n>>> 评测子集: {subject}")
         
         task_cfg = TaskConfig(
             model='deepseek-v3-tucker',
@@ -213,9 +217,10 @@ def run_ceval_evaluation():
             datasets=['ceval'],
             dataset_args={
                 'ceval': {
-                    'subset_list': [subset],
+                    'local_path': f'/path/to/your/local/ceval/{subject}/dataset',
+                    'subset_list': [subject],
                     'few_shot_num': 1,
-                },
+                }
             },
             generation_config={
                 'max_tokens': 2048,
@@ -225,24 +230,23 @@ def run_ceval_evaluation():
             no_timestamp=True,
             eval_batch_size=4,
             limit=50,
-            work_dir=os.path.join(f"{work_dir_base}/ceval", subset),
-            use_cache=os.path.join(f"{work_dir_base}/ceval", subset)
+            work_dir=os.path.join(f"{work_dir_base}/ceval", subject),
+            use_cache=os.path.join(f"{work_dir_base}/ceval", subject)
         )
 
         try:
             run_task(task_cfg)
-            print(f"✓ 子集 {subset} 评测完成")
+            print(f"✓ 子集 {subject} 评测完成")
             
-            # 读取结果
-            report_path = os.path.join(work_dir_base, 'ceval', subset, 'reports', 'deepseek-v3-tucker', 'ceval.json')
+            report_path = os.path.join(work_dir_base, 'ceval', subject, 'reports', 'deepseek-v3-tucker', 'ceval.json')
             if os.path.exists(report_path):
                 with open(report_path, 'r') as f:
                     data = json.load(f)
                     acc = data.get('results', [{}])[0].get('score', 'N/A')
-                    print(f"{subset} 准确率: {acc}")
+                    print(f"{subject} 准确率: {acc}")
                     
         except Exception as e:
-            print(f"✗ 子集 {subset} 运行失败: {e}")
+            print(f"✗ 子集 {subject} 运行失败: {e}")
             continue
 
 def run_all_evaluations():
@@ -251,6 +255,7 @@ def run_all_evaluations():
     print("请确保以下条件满足：")
     print("1. api_inference.py 服务正在运行在 http://127.0.0.1:8888")
     print("2. model_adapter.py 已导入并注册了 distributed_deepseek 适配器")
+    print("3. 本地数据集文件已准备好（HuggingFace格式）")
     print("="*80)
     
     try:
@@ -274,11 +279,11 @@ def run_all_evaluations():
 
 if __name__ == '__main__':
     # 可以选择运行单个评测或全部评测
-    # run_winogrande_evaluation()
+    run_winogrande_evaluation()
     # run_piqa_evaluation()
     # run_arc_evaluation()
     # run_mmlu_evaluation()
     # run_ceval_evaluation()
     
     # 或者运行所有评测
-    run_all_evaluations()
+    # run_all_evaluations()
