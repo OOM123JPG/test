@@ -30,16 +30,19 @@ class DistributedDeepSeekAdapter(ModelAPI):
                  config: GenerateConfig = None, 
                  **kwargs) -> ModelOutput:
         """
-        改进后的生成方法：支持文本生成和 Log-likelihood 提取
+        改进后的生成方法：
+        1. 自动识别 Log-likelihood (Completion) 模式与 Chat 模式
+        2. 兼容解析 choices[0]['text'] 和 choices[0]['message']['content']
         """
         gen_config = config or self.config
         
-        # 判断是否为 Log-likelihood 请求 (EvalScope 评测任务常带 logprobs 参数)
-        # 或者判断输入是否为纯字符串 (Completion 模式)
-        is_completion_mode = isinstance(input, str) or kwargs.get('logprobs') is not None
+        # 判断请求类型：EvalScope 在算概率时会传 logprobs，或者输入是纯字符串
+        is_ll_task = kwargs.get('logprobs') is not None
+        is_completion = isinstance(input, str)
         
-        if is_completion_mode:
-            # 走我们修复好的 /v1/completions 接口
+        if is_ll_task or is_completion:
+            # 走 /v1/completions 接口 (Log-likelihood 必须走这个)
+            target_url = self.completions_url
             prompt = input if isinstance(input, str) else input[-1].content
             request_data = {
                 "model": self.model_name,
@@ -47,38 +50,48 @@ class DistributedDeepSeekAdapter(ModelAPI):
                 "max_tokens": gen_config.max_tokens or 1,
                 "temperature": gen_config.temperature or 0.0,
                 "logprobs": kwargs.get('logprobs', 1),
-                "echo": kwargs.get('echo', True) # 评测通常需要 echo
+                "echo": kwargs.get('echo', True)
             }
-            target_url = self.completions_url
         else:
-            # 走标准的聊天接口
+            # 走 /v1/chat/completions 接口 (标准对话)
+            target_url = self.chat_completions_url
             request_data = {
                 "model": self.model_name,
                 "messages": self._convert_chat_messages(input),
                 "max_tokens": gen_config.max_tokens or 128,
-                "temperature": gen_config.temperature or 0.7
+                "temperature": gen_config.temperature or 0.7,
+                "top_p": gen_config.top_p or 0.9
             }
-            target_url = self.chat_completions_url
 
         try:
             response = self.session.post(target_url, json=request_data, timeout=self.timeout)
             response.raise_for_status()
             result = response.json()
             
+            # 安全性检查：确保 choices 存在且不为空
+            if not result.get("choices"):
+                logging.error(f"API 返回异常，没有 choices 字段: {result}")
+                return ModelOutput(model=self.model_name, content="", error="Empty choices from API")
+            
             choice = result["choices"][0]
             
-            # --- 核心改进：提取并透传 logprobs ---
-            # 如果 API 返回了 logprobs（包含我们修复的 tokens 和 token_logprobs），塞进 raw_response
-            # EvalScope 的 Evaluator 会从 raw_response 或 metadata 中读取它
-            model_output = ModelOutput(
+            # 兼容性解析内容
+            # 补全接口使用 'text'，聊天接口使用 'message'
+            content = ""
+            if "text" in choice:
+                content = choice["text"]
+            elif "message" in choice:
+                content = choice["message"].get("content", "")
+            
+            # 返回 ModelOutput，并透传 raw_response 供 EvalScope 计算概率
+            return ModelOutput(
                 model=self.model_name,
-                content=choice.get("text", choice.get("message", {}).get("content", "")),
-                raw_response=result  # 将整个 API 返回传给 EvalScope 进行解析
+                content=content,
+                raw_response=result
             )
-            return model_output
             
         except Exception as e:
-            logging.error(f"[DistributedDeepSeekAdapter] 请求失败: {e}")
+            logging.error(f"[DistributedDeepSeekAdapter] 请求异常: {str(e)}")
             return ModelOutput(model=self.model_name, content="", error=str(e))
 
     def batch_generate(self, inputs: List[List[ChatMessage]], 
