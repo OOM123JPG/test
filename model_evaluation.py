@@ -3,8 +3,11 @@ import json
 from evalscope.run import run_task
 from evalscope.config import TaskConfig
 
+# 重要：导入自定义适配器，确保它被注册
+from model_adapter import DistributedDeepSeekAdapter
+
 # 设置工作目录
-work_dir_base = '/home/GZGKD001/tmp/yanhong/tdmoe_deepseek/output/evaluation_/eval_evalscope_36_layers'
+work_dir_base = '/nfs-share/wx1463835/tdmode/output/evaluation/evalscope'
 os.makedirs(work_dir_base, exist_ok=True)
 print("Evaluation results will be saved to:", work_dir_base)
 
@@ -15,18 +18,17 @@ def run_winogrande_evaluation():
     print("="*50)
     
     task_cfg = TaskConfig(
-        model='deepseek-v3-tucker',  # 修改为你的模型名称
-        eval_type='openai_api', 
-        api_url='http://127.0.0.1:8888/v1/chat/completions',  # 使用你的API地址
-        api_key='EMPTY',
+        model='deepseek-v3-tucker',  # 模型名称
+        eval_type='distributed_deepseek',  # 使用自定义适配器
+        api_url='http://127.0.0.1:8888',   # 传递给适配器的参数
         datasets=['winogrande'],
         generation_config={
-            'max_tokens': 5,  # Winogrande通常只需要很短的回答
-            'temperature': 0.0,  # 确定性输出
+            'max_tokens': 5,
+            'temperature': 0.0,
         },
         no_timestamp=True,
         eval_batch_size=16,
-        limit=100,  # 评测100个样本
+        limit=100,
         work_dir=f'{work_dir_base}/winogrande',
         use_cache=f'{work_dir_base}/winogrande'
     )
@@ -53,18 +55,17 @@ def run_piqa_evaluation():
     print("="*50)
     
     task_cfg = TaskConfig(
-        model='deepseek-v3-tucker',  # 修改为你的模型名称
-        eval_type='openai_api', 
-        api_url='http://127.0.0.1:8888/v1/chat/completions',  # 使用你的API地址
-        api_key='EMPTY',
+        model='deepseek-v3-tucker',
+        eval_type='distributed_deepseek',
+        api_url='http://127.0.0.1:8888',
         datasets=['piqa'],
         generation_config={
-            'max_tokens': 5,  # PIQA通常只需要很短的回答
-            'temperature': 0.0,  # 确定性输出
+            'max_tokens': 5,
+            'temperature': 0.0,
         },
         no_timestamp=True,
         eval_batch_size=16,
-        limit=100,  # 评测100个样本
+        limit=100,
         work_dir=f'{work_dir_base}/piqa',
         use_cache=f'{work_dir_base}/piqa'
     )
@@ -95,9 +96,8 @@ def run_arc_evaluation():
         
         task_cfg = TaskConfig(
             model='deepseek-v3-tucker', 
-            eval_type='openai_api', 
-            api_url='http://127.0.0.1:8888/v1/chat/completions',
-            api_key='EMPTY',
+            eval_type='distributed_deepseek',
+            api_url='http://127.0.0.1:8888',
             datasets=['arc'],
             dataset_args={
                 'arc': {
@@ -137,7 +137,7 @@ def run_mmlu_evaluation():
     print(">>> 开始评测 MMLU")
     print("="*50)
     
-    # MMLU子集列表（选择一些代表性的子集进行评测）
+    # MMLU子集列表
     mmlu_subsets = [
         'astronomy', 'college_biology', 'college_chemistry', 
         'college_computer_science', 'college_mathematics', 'college_physics', 
@@ -149,14 +149,12 @@ def run_mmlu_evaluation():
     for subset in mmlu_subsets:
         print(f"\n>>> 评测子集: {subset}")
         
-        # 为每个子集创建独立的输出目录
         subset_work_dir = os.path.join(work_dir_base, 'mmlu', subset)
         
         task_cfg = TaskConfig(
             model='deepseek-v3-tucker', 
-            eval_type='openai_api', 
-            api_url='http://127.0.0.1:8888/v1/chat/completions',
-            api_key='EMPTY',
+            eval_type='distributed_deepseek',
+            api_url='http://127.0.0.1:8888',
             datasets=['mmlu'],
             dataset_args={
                 'mmlu': {
@@ -169,7 +167,7 @@ def run_mmlu_evaluation():
             },       
             no_timestamp=True,
             eval_batch_size=4,
-            limit=50,  # 每个子集评测50个样本
+            limit=50,
             work_dir=subset_work_dir,
             use_cache=subset_work_dir
         )
@@ -198,7 +196,6 @@ def run_ceval_evaluation():
     print(">>> 开始评测 CEval")
     print("="*50)
     
-    # 选择一些代表性的STEM子集
     stem_subsets = [
         "computer_network", "operating_system", "college_programming", 
         "college_physics", "high_school_mathematics", "high_school_physics"
@@ -211,9 +208,8 @@ def run_ceval_evaluation():
         
         task_cfg = TaskConfig(
             model='deepseek-v3-tucker',
-            eval_type='openai_api', 
-            api_url='http://127.0.0.1:8888/v1/chat/completions',
-            api_key='EMPTY',
+            eval_type='distributed_deepseek',
+            api_url='http://127.0.0.1:8888',
             datasets=['ceval'],
             dataset_args={
                 'ceval': {
@@ -252,8 +248,9 @@ def run_ceval_evaluation():
 def run_all_evaluations():
     """运行所有评测"""
     print("开始运行所有评测...")
-    print("请确保 api_inference.py 服务正在运行在 http://127.0.0.1:8888")
-    print("使用命令: python api_inference.py --model_path /path/to/model --whitening_dir /path/to/data --port 8888")
+    print("请确保以下条件满足：")
+    print("1. api_inference.py 服务正在运行在 http://127.0.0.1:8888")
+    print("2. model_adapter.py 已导入并注册了 distributed_deepseek 适配器")
     print("="*80)
     
     try:
