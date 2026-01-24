@@ -32,6 +32,7 @@ def run_winogrande_evaluation():
         generation_config={
             'max_tokens': 5,
             'temperature': 0.0,
+            'logprobs': 1,
         },
         no_timestamp=True,
         eval_batch_size=16,
