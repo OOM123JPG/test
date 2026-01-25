@@ -570,6 +570,7 @@ async def chat_completions(request: ChatCompletionRequest):
     return {
         "id": req_id, 
         "object": "chat.completion", 
+        "model": "deepseek-v3-tucker",
         "choices": [{
             "message": {"role": "assistant", "content": res}, 
             "index": 0, 
@@ -641,7 +642,7 @@ async def completions(request: CompletionRequest):
         else:
             choices.append({"text": res, "index": i, "finish_reason": "stop"})
             
-    return {"id": req_id_base, "object": "text_completion", "choices": choices}
+    return {"id": req_id_base, "object": "text_completion", "choices": choices, "model": "deepseek-v3-tucker"}
 
 def main():
     parser = argparse.ArgumentParser()
