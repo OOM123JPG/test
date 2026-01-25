@@ -107,7 +107,7 @@ class DistributedInferenceEngine:
 
         full_model = AutoModelForCausalLM.from_pretrained(self.args.model_path, torch_dtype=torch.bfloat16, trust_remote_code=True, device_map={"": "cpu"})
         
-        mid = 34
+        mid = 29
         all_l = full_model.model.layers
         if self.args.node_rank == 0:
             full_model.model.layers = nn.ModuleList([all_l[i] for i in range(mid)])
@@ -192,122 +192,71 @@ class DistributedInferenceEngine:
         executor.shutdown(wait=True); gc.collect(); torch.npu.empty_cache()
 
     async def run_loop(self):
-        logger.info(f"Node {self.args.node_rank} 推理循环已就绪")
         while self.is_running:
             active_reqs = []
-            task_code = 0
-            p_args = {}
-            real_batch_size = 0
-
             if self.args.node_rank == 0:
                 try:
-                    # 1. 聚合请求
                     req = await asyncio.wait_for(self.req_queue.get(), timeout=0.1)
                     active_reqs.append(req)
-                    while not self.req_queue.empty() and len(active_reqs) < 16:
+                    while not self.req_queue.empty() and len(active_reqs) < 16: 
                         active_reqs.append(self.req_queue.get_nowait())
                 except asyncio.TimeoutError:
-                    dist.broadcast(torch.tensor([0], dtype=torch.long, device="npu:0"), src=0)
-                    continue
+                    dist.broadcast(torch.tensor([0], dtype=torch.long, device="npu:0"), src=0); continue
 
-                # 2. 【关键修复】平铺所有 Prompt，处理 str 和 list[str] 混合情况
-                all_prompts = []
-                for r in active_reqs:
-                    # 【修复】同时尝试获取 prompt 和 prompts
-                    p = r.get('prompt') or r.get('prompts') 
-                    
-                    if isinstance(p, list):
-                        all_prompts.extend([str(x) for x in p])
-                    elif p is not None:
-                        all_prompts.append(str(p))
+                dist.broadcast(torch.tensor([len(active_reqs)], dtype=torch.long, device="npu:0"), src=0)
+                p_args = active_reqs[0]
                 
-                real_batch_size = len(all_prompts)
+                if p_args['type'] == 'loglikelihood':
+                    self.tokenizer.padding_side = "right"  # 算分任务用右填充
+                else:
+                    self.tokenizer.padding_side = "left"   # 生成任务用左填充，方便续写
                 
-                # 3. 广播同步信号与 Batch 大小
-                dist.broadcast(torch.tensor([real_batch_size], dtype=torch.long, device="npu:0"), src=0)
+                task_code = 1 if p_args['type'] == 'loglikelihood' else 0
                 
-                # 4. 广播推理参数
-                first_req = active_reqs[0]
-                task_code = 1 if first_req.get('type') == 'loglikelihood' else 0
+                logger.info(f"Node 0 Broadcasting: task={task_code}, max_len={p_args['max_tokens']}, temp={p_args['temp']}, top_p={p_args['top_p']}, rep_pen={p_args.get('rep_pen', 'MISSING')}")
+                
                 params = torch.tensor([
-                    float(task_code), 
-                    float(first_req.get('max_tokens', 128)), 
-                    float(first_req.get('temp', 0.0)), 
-                    float(first_req.get('top_p', 1.0)), 
-                    float(first_req.get('cont_len', 2048))
+                    task_code, 
+                    p_args['max_tokens'], 
+                    p_args['temp'], 
+                    p_args['top_p'], 
+                    p_args.get('cont_len', 0),
+                    p_args.get('rep_pen', 1.0)
                 ], device="npu:0", dtype=torch.float32)
                 dist.broadcast(params, src=0)
-
-                # 5. 编码并广播 input_ids
-                inputs = self.tokenizer(all_prompts, return_tensors="pt", padding=True).to("npu:0")
-                input_ids = inputs.input_ids
-                dist.broadcast(torch.tensor([input_ids.shape[1]], dtype=torch.long, device="npu:0"), src=0)
-                dist.broadcast(input_ids, src=0)
                 
-                logger.info(f"[Node 0] 处理请求: 聚合数={len(active_reqs)}, 实际Batch={real_batch_size}, 任务={task_code}")
-
+                inputs = self.tokenizer([r['prompt'] for r in active_reqs], return_tensors="pt", padding=True).to("npu:0")
+                dist.broadcast(torch.tensor([inputs.input_ids.shape[1]], dtype=torch.long, device="npu:0"), src=0)
+                dist.broadcast(inputs.input_ids, src=0)
+                input_ids = inputs.input_ids
             else:
-                # ==================== Node 1 接收逻辑 ====================
                 signal = torch.zeros([1], dtype=torch.long, device="npu:0")
                 dist.broadcast(signal, src=0)
                 if signal.item() == 0: continue
-                
-                real_batch_size = int(signal.item())
-                params = torch.zeros([5], device="npu:0", dtype=torch.float32)
+                batch_size = int(signal.item())
+                params = torch.zeros([6], device="npu:0")
                 dist.broadcast(params, src=0)
-                task_code, p_max, p_temp, p_top, p_cont = params.tolist()
-                p_args = {'max_tokens': int(p_max), 'temp': p_temp, 'top_p': p_top, 'cont_len': int(p_cont)}
+                # task_code, p_max, p_temp, p_top, p_cont = params.tolist()
+                task_code, p_max, p_temp, p_top, p_cont, p_rep = params.tolist()
+                p_args = {'max_tokens': int(p_max), 'temp': p_temp, 'top_p': p_top, 'cont_len': int(p_cont),'rep_pen': p_rep}
+                
+                logger.info(f"Node 1 Received: {p_args}")
                 
                 seq_len_t = torch.zeros([1], dtype=torch.long, device="npu:0")
                 dist.broadcast(seq_len_t, src=0)
-                input_ids = torch.zeros((real_batch_size, int(seq_len_t.item())), dtype=torch.long, device="npu:0")
+                input_ids = torch.zeros((batch_size, int(seq_len_t.item())), dtype=torch.long, device="npu:0")
                 dist.broadcast(input_ids, src=0)
-                
-                logger.info(f"[Node 1] 接收 Batch: {real_batch_size}, 任务: {task_code}")
 
-            # ==================== 同步执行推理 ====================
-            try:
-                if task_code == 1:
-                    results = self._execute_loglikelihood_sync(input_ids, real_batch_size, p_args)
-                else:
-                    if self.args.node_rank == 0:
-                        p_args = {'max_tokens': int(params[1]), 'temp': params[2], 'top_p': params[3]}
-                    results = self._execute_inference_sync(input_ids, real_batch_size, p_args)
-            except Exception as e:
-                logger.error(f"推理失败: {e}")
-                results = ["Error"] * real_batch_size
-
-            # ==================== 结果分发 (仅 Node 0) ====================
+            if task_code == 1: 
+                results = self._execute_loglikelihood_sync(input_ids, len(input_ids), p_args)
+            else: 
+                results = self._execute_inference_sync(input_ids, len(input_ids), p_args)
+            
             if self.args.node_rank == 0:
-                if self.args.node_rank == 0:
-                    all_rids = []
-                    for r in active_reqs:
-                        # 【修复】判断条件与上面对齐
-                        p = r.get('prompt') or r.get('prompts')
-                        
-                        if isinstance(p, list):
-                            if 'batch_ids' in r: 
-                                all_rids.extend(r['batch_ids'])
-                            else:
-                                base_id = r.get('id', str(uuid.uuid4()))
-                                all_rids.extend([f"{base_id}-{j}" for j in range(len(p))])
-                        else:
-                            rid = r.get('id')
-                            if rid is None:
-                                # 如果实在没有 id，尝试从 batch_ids 取第一个
-                                b_ids = r.get('batch_ids')
-                                rid = b_ids[0] if b_ids else "unknown_id"
-                            all_rids.append(rid)
-                
-                for i, rid in enumerate(all_rids):
-                    if i < len(results):
-                        self.results[rid] = results[i]
-                        if rid in self.events:
-                            self.events[rid].set()
-                logger.info(f"[Node 0] {len(all_rids)} 个结果已就绪")
-                
-                
-                
+                for i, req in enumerate(active_reqs):
+                    rid = req['id']; self.results[rid] = results[i]
+                    if rid in self.events: self.events[rid].set()
+
     # def _execute_loglikelihood_sync(self, input_ids, batch_size, p_args):
     #     cont_len = int(p_args['cont_len'])
     #     with torch.no_grad():
@@ -343,207 +292,278 @@ class DistributedInferenceEngine:
     #             return relevant_logprobs.tolist()
     
     # 修改 loglikelihood 接口 
+    # def _execute_loglikelihood_sync(self, input_ids, batch_size, p_args):
+    #     with torch.no_grad():
+    #         q_len = input_ids.shape[1]
+    #         padding_mask = (input_ids != self.tokenizer.pad_token_id).long().to("npu:0")
+    #         causal_mask = torch.triu(torch.full((q_len, q_len), float("-inf"), device="npu:0"), 1)
+    #         mask = causal_mask.view(1, 1, q_len, q_len) + (1.0 - padding_mask.view(batch_size, 1, 1, q_len).to(torch.bfloat16)) * -10000.0
+            
+    #         if self.args.node_rank == 0:
+    #             h = self.model.model.embed_tokens(input_ids)
+    #             for layer in self.model.model.layers: 
+    #                 h = layer(h.to(next(layer.parameters()).device), attention_mask=mask.to(next(layer.parameters()).device), use_cache=False)[0]
+    #             dist.send(tensor=h.to("npu:0").to(torch.bfloat16).contiguous(), dst=1)
+                
+    #             # 接收批次结果：[batch, q_len]
+    #             logprobs_recv = torch.zeros((batch_size, q_len), device="npu:0", dtype=torch.float32)
+    #             dist.recv(tensor=logprobs_recv, src=1)
+    #             return logprobs_recv.tolist()
+    #         else:
+    #             h_recv = torch.zeros((batch_size, q_len, self.model.config.hidden_size), dtype=torch.bfloat16, device="npu:0")
+    #             dist.recv(tensor=h_recv, src=0); h = h_recv
+    #             for layer in self.model.model.layers: 
+    #                 h = layer(h.to(next(layer.parameters()).device), attention_mask=mask.to(next(layer.parameters()).device), use_cache=False)[0]
+                
+    #             logits = self.model.lm_head(self.model.model.norm(h.to(next(self.model.lm_head.parameters()).device)))
+    #             logprobs = F.log_softmax(logits.float(), dim=-1)
+                
+    #             target_ids = input_ids[:, 1:].unsqueeze(-1).to(logprobs.device)
+    #             relevant_logprobs = logprobs[:, :-1, :].gather(-1, target_ids).squeeze(-1) 
+                
+    #             # 修复处：使用 new_zeros 确保设备严格一致
+    #             padding_val = relevant_logprobs.new_zeros((batch_size, 1))
+    #             final_logprobs = torch.cat([padding_val, relevant_logprobs], dim=-1)
+                
+    #             dist.send(tensor=final_logprobs.to("npu:0").to(torch.float32).contiguous(), dst=0)
+    #             return final_logprobs.tolist()
+    
     def _execute_loglikelihood_sync(self, input_ids, batch_size, p_args):
+        # 无论 Batch=1 还是 >1，都统一逻辑
+        # 获取真正的负无穷 (Tucker 压缩模型必须用这个，-10000 不够屏蔽噪声)
+        min_dtype = torch.finfo(torch.bfloat16).min
+
         with torch.no_grad():
             q_len = input_ids.shape[1]
+            
+            # 1. 构建 Mask (保持不变)
+            # 注意：这里 mask 创建在 npu:0 是没问题的，因为后续传给 layer 时会自动 .to(layer.device)
             padding_mask = (input_ids != self.tokenizer.pad_token_id).long().to("npu:0")
-            # causal_mask = torch.triu(torch.full((q_len, q_len), float("-inf"), device="npu:0"), 1)
-            # mask = causal_mask.view(1, 1, q_len, q_len) + (1.0 - padding_mask.view(batch_size, 1, 1, q_len).to(torch.bfloat16)) * -10000.0
+            causal_mask = torch.triu(torch.full((q_len, q_len), min_dtype, device="npu:0"), 1)
+            pad_mask_expanded = (1.0 - padding_mask.view(batch_size, 1, 1, q_len).to(torch.bfloat16)) * min_dtype
+            mask = causal_mask.view(1, 1, q_len, q_len) + pad_mask_expanded
             
-            causal_mask = torch.triu(torch.full((q_len, q_len), float("-inf"), device="npu:0"), 1)
-            causal_mask = causal_mask.view(1, 1, q_len, q_len).expand(batch_size, -1, -1, -1)
-            mask = causal_mask + (1.0 - padding_mask.view(batch_size, 1, 1, q_len).to(torch.bfloat16)) * -10000.0
-            
+            # 2. 显式构建 Position IDs (保持不变)
+            position_ids = torch.arange(q_len, dtype=torch.long, device="npu:0").unsqueeze(0).repeat(batch_size, 1)
+
             if self.args.node_rank == 0:
+                # ... (Rank 0 逻辑保持不变) ...
                 h = self.model.model.embed_tokens(input_ids)
                 for layer in self.model.model.layers: 
-                    h = layer(h.to(next(layer.parameters()).device), attention_mask=mask.to(next(layer.parameters()).device), use_cache=False)[0]
+                    h = layer(h.to(next(layer.parameters()).device), 
+                              attention_mask=mask.to(next(layer.parameters()).device), 
+                              position_ids=position_ids.to(next(layer.parameters()).device), 
+                              use_cache=False)[0]
                 dist.send(tensor=h.to("npu:0").to(torch.bfloat16).contiguous(), dst=1)
-                
-                # 接收批次结果：[batch, q_len]
                 logprobs_recv = torch.zeros((batch_size, q_len), device="npu:0", dtype=torch.float32)
                 dist.recv(tensor=logprobs_recv, src=1)
                 return logprobs_recv.tolist()
             else:
+                # === Rank 1 逻辑 (修复这里) ===
                 h_recv = torch.zeros((batch_size, q_len, self.model.config.hidden_size), dtype=torch.bfloat16, device="npu:0")
                 dist.recv(tensor=h_recv, src=0); h = h_recv
+                
                 for layer in self.model.model.layers: 
-                    h = layer(h.to(next(layer.parameters()).device), attention_mask=mask.to(next(layer.parameters()).device), use_cache=False)[0]
+                    h = layer(h.to(next(layer.parameters()).device), 
+                              attention_mask=mask.to(next(layer.parameters()).device), 
+                              position_ids=position_ids.to(next(layer.parameters()).device), 
+                              use_cache=False)[0]
                 
+                # 计算 Logits (这会在 npu:3 上)
                 logits = self.model.lm_head(self.model.model.norm(h.to(next(self.model.lm_head.parameters()).device)))
-                logprobs = F.log_softmax(logits.float(), dim=-1)
+                log_softmax = F.log_softmax(logits.float(), dim=-1)
                 
-                target_ids = input_ids[:, 1:].unsqueeze(-1).to(logprobs.device)
-                relevant_logprobs = logprobs[:, :-1, :].gather(-1, target_ids).squeeze(-1) 
+                target_ids = input_ids[:, 1:].unsqueeze(-1).to(log_softmax.device)
+                relevant_logprobs = log_softmax[:, :-1, :].gather(-1, target_ids).squeeze(-1)
                 
-                # 修复处：使用 new_zeros 确保设备严格一致
-                padding_val = relevant_logprobs.new_zeros((batch_size, 1))
+                # 错误写法: padding_val = torch.zeros((batch_size, 1), device="npu:0", ...)
+                # 正确写法: 无论 relevant_logprobs 在哪张卡(npu:3)，padding_val 都跟过去
+                padding_val = relevant_logprobs.new_zeros((batch_size, 1)) 
+                
+                # 现在 cat 就安全了 (都在 npu:3)
                 final_logprobs = torch.cat([padding_val, relevant_logprobs], dim=-1)
                 
+                # 发送前再统一转回 npu:0，因为 dist.send 通常默认走主卡
                 dist.send(tensor=final_logprobs.to("npu:0").to(torch.float32).contiguous(), dst=0)
+                                
                 return final_logprobs.tolist()
 
     def _execute_inference_sync(self, input_ids, batch_size, p_args):
-        """
-        同步执行推理任务。已修复维度硬编码问题，支持动态 Batch Size。
-        """
-        
-        # 记录 Prompt 长度
-        prompt_len = input_ids.shape[1]
-        batch_ids = input_ids.tolist()
-        past_key_values = DynamicCache()
-        curr_input_ids = input_ids
-        
-        
-        # 初始化变量
-        batch_ids = input_ids.tolist()
-        past_key_values = DynamicCache()
-        curr_input_ids = input_ids
-        
-        # 建立初始 mask 和 position_ids
-        # current_mask 形状: [batch_size, seq_len]
+        input_length = input_ids.shape[1]
+                        
+        rep_pen = p_args.get('rep_pen', 1.0)
+        batch_ids = input_ids.tolist(); past_key_values = DynamicCache(); curr_input_ids = input_ids
         current_mask = (curr_input_ids != self.tokenizer.pad_token_id).long().to("npu:0")
         position_ids = current_mask.cumsum(-1) - 1
         position_ids.masked_fill_(current_mask == 0, 0)
+        finished, max_gen = [False] * batch_size, int(p_args['max_tokens'])
         
-        # 获取当前实际的 batch_size (应对多请求聚合)
-        actual_bsz = curr_input_ids.shape[0]
-        finished = [False] * actual_bsz
-        max_gen = int(p_args['max_tokens'])
-        
-        logger.info(f"[Debug] 开始推理: BatchSize={actual_bsz}, MaxGen={max_gen}, InputLen={curr_input_ids.shape[1]}")
-
+        logger.info(f"Node {self.args.node_rank} Executing Inference: Temp={p_args['temp']:.2f}, TopP={p_args['top_p']:.2f}, RepPen={rep_pen:.2f}, InputLen={input_length}")
         with torch.no_grad():
             for step in range(max_gen):
                 is_prefill = (step == 0)
+                total_len = curr_input_ids.shape[1] if is_prefill else len(batch_ids[0])
                 q_len = curr_input_ids.shape[1]
-                total_len = current_mask.shape[1]
-                
-                # ========== 动态 Mask 构建 ==========
                 if is_prefill:
-                    # Prefill 阶段：构建三角形因果掩码 [q_len, q_len]
                     causal_mask = torch.triu(torch.full((q_len, q_len), float("-inf"), device="npu:0"), 1)
-                    # 关键修复：扩展到 [actual_bsz, 1, q_len, q_len]
-                    causal_mask = causal_mask.view(1, 1, q_len, q_len).expand(actual_bsz, -1, -1, -1)
-                    # 关键修复：使用 reshape 动态匹配实际 batch
-                    padding_mask = (1.0 - current_mask.reshape(actual_bsz, 1, 1, q_len).to(torch.bfloat16)) * -10000.0
-                    mask = causal_mask + padding_mask
-                    
-                    if step == 0:
-                        logger.debug(f"[Debug] Prefill Mask Shape: {mask.shape}, CurrentMask Size: {current_mask.numel()}")
-                else:
-                    # Decoding 阶段：只需要处理 padding [actual_bsz, 1, 1, total_len]
-                    mask = (1.0 - current_mask.reshape(actual_bsz, 1, 1, total_len).to(torch.bfloat16)) * -10000.0
-
-                # ========== 分布式层推理 ==========
+                    mask = causal_mask.view(1, 1, q_len, q_len) + (1.0 - current_mask.view(batch_size, 1, 1, q_len).to(torch.bfloat16)) * -10000.0
+                else: mask = (1.0 - current_mask.view(batch_size, 1, 1, total_len).to(torch.bfloat16)) * -10000.0
                 if self.args.node_rank == 0:
-                    # Node 0: Embedding -> 前半部分 Layers
                     h = self.model.model.embed_tokens(curr_input_ids)
-                    for i, layer in enumerate(self.model.model.layers): 
-                        h = layer(
-                            h.to(next(layer.parameters()).device), 
-                            attention_mask=mask.to(next(layer.parameters()).device), 
-                            position_ids=position_ids.to(next(layer.parameters()).device), 
-                            past_key_value=past_key_values, 
-                            use_cache=True
-                        )[0]
-                    
-                    # 发送中间隐向量给 Node 1
+                    for layer in self.model.model.layers: h = layer(h.to(next(layer.parameters()).device), attention_mask=mask.to(next(layer.parameters()).device), position_ids=position_ids.to(next(layer.parameters()).device), past_key_value=past_key_values, use_cache=True)[0]
                     dist.send(tensor=h.to("npu:0").to(torch.bfloat16).contiguous(), dst=1)
-                    
-                    # 接收 Node 1 生成的 Token ID
-                    new_ids_dev = torch.zeros((actual_bsz, 1), dtype=torch.long, device="npu:0")
-                    dist.recv(tensor=new_ids_dev, src=1)
-                    curr_input_ids = new_ids_dev
+                    new_ids_dev = torch.zeros((batch_size, 1), dtype=torch.long, device="npu:0")
+                    dist.recv(tensor=new_ids_dev, src=1); curr_input_ids = new_ids_dev
                 else:
-                    # Node 1: 接收隐向量 -> 后半部分 Layers -> LM Head
-                    h_recv = torch.zeros((actual_bsz, q_len, self.model.config.hidden_size), dtype=torch.bfloat16, device="npu:0")
-                    dist.recv(tensor=h_recv, src=0)
-                    h = h_recv
-                    
-                    for layer in self.model.model.layers: 
-                        h = layer(
-                            h.to(next(layer.parameters()).device), 
-                            attention_mask=mask.to(next(layer.parameters()).device), 
-                            position_ids=position_ids.to(next(layer.parameters()).device), 
-                            past_key_value=past_key_values, 
-                            use_cache=True
-                        )[0]
-                    
-                    # 取最后一个 token 的 logits 进行采样
+                    h_recv = torch.zeros((batch_size, q_len, self.model.config.hidden_size), dtype=torch.bfloat16, device="npu:0")
+                    dist.recv(tensor=h_recv, src=0); h = h_recv
+                    for layer in self.model.model.layers: h = layer(h.to(next(layer.parameters()).device), attention_mask=mask.to(next(layer.parameters()).device), position_ids=position_ids.to(next(layer.parameters()).device), past_key_value=past_key_values, use_cache=True)[0]
                     logits = self.model.lm_head(self.model.model.norm(h.to(next(self.model.lm_head.parameters()).device)))[:, -1, :]
-                    logits = apply_sampling(logits, p_args['temp'], p_args['top_p'], 1.1, batch_ids)
-                    
-                    if p_args['temp'] > 0:
-                        probs = torch.softmax(logits, dim=-1)
-                        next_tokens = torch.multinomial(probs, 1)
-                    else:
-                        next_tokens = torch.argmax(logits, -1, True)
-                    
-                    # 发送生成的 Token ID 回 Node 0
-                    dist.send(tensor=next_tokens.to("npu:0").contiguous(), dst=0)
-                    curr_input_ids = next_tokens.to("npu:0")
-
-                # ========== 状态更新与停止判定 ==========
+                    # logits = apply_sampling(logits, p_args['temp'], p_args['top_p'], 1.1, batch_ids)
+                    logits = apply_sampling(logits, p_args['temp'], p_args['top_p'], rep_pen, batch_ids)
+                    next_tokens = torch.multinomial(torch.softmax(logits, dim=-1), 1) if p_args['temp'] > 0 else torch.argmax(logits, -1, True)
+                    dist.send(tensor=next_tokens.to("npu:0").contiguous(), dst=0); curr_input_ids = next_tokens.to("npu:0")
                 nt_list = curr_input_ids.squeeze(-1).tolist()
-                for i in range(actual_bsz):
+                for i in range(batch_size):
                     if not finished[i]:
                         batch_ids[i].append(nt_list[i])
-                        if nt_list[i] == self.tokenizer.eos_token_id: 
-                            finished[i] = True
+                        if nt_list[i] == self.tokenizer.eos_token_id: finished[i] = True
+                if all(finished): break
+                current_mask = torch.cat([current_mask, torch.ones((batch_size, 1), device="npu:0")], dim=-1)
+                position_ids = torch.full((batch_size, 1), len(batch_ids[0]) - 1, dtype=torch.long, device="npu:0")
                 
-                if all(finished): 
-                    logger.info(f"[Debug] 推理提前结束 (Step {step})")
-                    break
-                    
-                # 更新下一轮所需的 Mask 和 Position ID
-                new_mask_col = torch.ones((actual_bsz, 1), device="npu:0", dtype=torch.long)
-                current_mask = torch.cat([current_mask, new_mask_col], dim=-1)
-                position_ids = torch.full((actual_bsz, 1), current_mask.shape[1] - 1, dtype=torch.long, device="npu:0")
-
-        # 解码返回
-        # decoded_res = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in batch_ids]
-        # logger.debug(f"[Debug] 推理完成，返回样本数量: {len(decoded_res)}")
-        
-        decoded_res = []
-        for i, ids in enumerate(batch_ids):
-            # 只取新生成的 token
-            full_text = self.tokenizer.decode(ids[prompt_len:], skip_special_tokens=True)
-            # 简单后处理：去掉模型可能带出的多余标签
-            clean_text = full_text.split("<｜Assistant｜>")[-1].strip()
-            decoded_res.append(clean_text)
-            logger.info(f"[Debug] 样本 {i} 生成结果预览: {repr(clean_text[:30])}")
+        output_texts = []
+        for ids in batch_ids:
+            # 切片：从 input_length 开始取
+            generated_ids = ids[input_length:]
+            text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+            output_texts.append(text)
             
-        return decoded_res
+        return output_texts
+        # return [self.tokenizer.decode(ids[input_length:], skip_special_tokens=True) for ids in batch_ids]
+
 
 # ==========================================
 # 4. API 路由
 # ==========================================
 app = FastAPI()
-class ChatCompletionRequest(BaseModel): model: str = "deepseek-v3-tucker"; messages: List[Dict]; max_tokens: int = 128; temperature: float = 0.7; top_p: float = 0.9
-class CompletionRequest(BaseModel): model: str = "deepseek-v3-tucker"; prompt: Union[str, List[str]]; max_tokens: int = 128; temperature: float = 0.0; top_p: float = 1.0; logprobs: Optional[int] = None; echo: bool = False
+class ChatCompletionRequest(BaseModel): 
+    model: str = "deepseek-v3-tucker"; messages: List[Dict]
+    max_tokens: int = 128
+    temperature: float = 0.7
+    top_p: float = 0.9
+    repetition_penalty: float = 1.2
 
+
+class CompletionRequest(BaseModel): 
+    model: str = "deepseek-v3-tucker"
+    prompt: Union[str, List[str]]
+    max_tokens: int = 128
+    temperature: float = 0.0
+    top_p: float = 1.0
+    repetition_penalty: float = 1.2
+    logprobs: Optional[int] = None
+    echo: bool = False
+    
+# @app.post("/v1/chat/completions")
+# async def chat_completions(request: ChatCompletionRequest):
+#     req_id = str(uuid.uuid4()); event = asyncio.Event(); engine.events[req_id] = event
+#     formatted_prompt = engine.tokenizer.apply_chat_template(request.messages, tokenize=False, add_generation_prompt=True)
+#     await engine.req_queue.put({"type": "chat", "id": req_id, "prompt": formatted_prompt, "max_tokens": request.max_tokens, "temp": request.temperature, "top_p": request.top_p})
+#     await event.wait(); res = engine.results.pop(req_id); del engine.events[req_id]
+#     return {"id": req_id, "object": "chat.completion", "choices": [{"message": {"role": "assistant", "content": res}, "index": 0, "finish_reason": "stop"}]}
+
+# @app.post("/v1/completions")
+# async def completions(request: CompletionRequest):
+#     req_id_base = str(uuid.uuid4())
+#     prompts = [request.prompt] if isinstance(request.prompt, str) else request.prompt
+#     is_ll = (request.logprobs is not None and request.logprobs > 0)
+    
+#     events, results_ids = [], []
+#     for i, p in enumerate(prompts):
+#         rid = f"{req_id_base}-{i}"
+#         ev = asyncio.Event()
+#         engine.events[rid] = ev
+#         events.append(ev)
+#         results_ids.append(rid)
+#         # 默认 cont_len 取全长度以兼容 loglikelihood
+#         await engine.req_queue.put({
+#             "type": "loglikelihood" if is_ll else "chat", 
+#             "id": rid, 
+#             "prompt": p, 
+#             "max_tokens": request.max_tokens, 
+#             "temp": request.temperature, 
+#             "top_p": request.top_p, 
+#             "cont_len": 2048 # 默认上限
+#         })
+    
+#     # 等待所有并发请求完成
+#     await asyncio.gather(*(ev.wait() for ev in events))
+    
+#     choices = []
+#     for i, rid in enumerate(results_ids):
+#         # 从结果池中获取推理结果
+#         res = engine.results.pop(rid)
+#         del engine.events[rid]
+        
+#         if is_ll:
+#             # 这里的 res 是 List[float]，代表序列中每个 token 的 logprobs
+#             # 为了修复 max() 报错，top_logprobs 必须包含实际的数值字典
+#             choices.append({
+#                 "text": prompts[i] if request.echo else "", 
+#                 "index": i, 
+#                 "logprobs": {
+#                     "token_logprobs": res, 
+#                     "tokens": ["<token>"] * len(res), 
+#                     # 将每一个 token 的概率放入字典，防止客户端 max(top.values()) 报错
+#                     "top_logprobs": [{"<token>": val} for val in res] 
+#                 }, 
+#                 "finish_reason": "stop"
+#             })
+#         else:
+#             # 普通生成任务返回文本结果
+#             choices.append({
+#                 "text": res, 
+#                 "index": i, 
+#                 "finish_reason": "stop"
+#             })
+            
+#     return {
+#         "id": req_id_base, 
+#         "object": "text_completion", 
+#         "choices": choices
+#     }
+
+# 修改 chat_completions 接口
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest):
     req_id = str(uuid.uuid4()); event = asyncio.Event(); engine.events[req_id] = event
 
-    # 它会自动插入 <｜User｜> 和 <｜Assistant｜> 标签
-    formatted_prompt = engine.tokenizer.apply_chat_template(
-        request.messages, 
-        tokenize=False, 
-        add_generation_prompt=True
-    )
+    # formatted_prompt = ""
+    # for msg in request.messages:
+    #     formatted_prompt += f"{msg['role']}: {msg['content']}\n"
+    # 如果你连 "user: " 这种前缀都不要，可以直接取最后一条：
+    # formatted_prompt = request.messages[-1]['content']
     
-    # Debug 打印：看看模型实际收到了什么格式
-    logger.info(f"[Debug] Chat Prompt 预览: {repr(formatted_prompt[:50])}...")
-
+    try:
+        formatted_prompt = engine.tokenizer.apply_chat_template(
+            request.messages, 
+            tokenize=False, 
+            add_generation_prompt=True
+        )
+    except Exception as e:
+        logger.warning(f"Template apply failed, fallback to raw: {e}")
+        formatted_prompt = request.messages[-1]['content']
+        
+    
     await engine.req_queue.put({
         "type": "chat", 
         "id": req_id, 
         "prompt": formatted_prompt, 
         "max_tokens": request.max_tokens, 
         "temp": request.temperature, 
-        "top_p": request.top_p
+        "top_p": request.top_p,
+        "rep_pen": request.repetition_penalty
     })
     await event.wait(); res = engine.results.pop(req_id); del engine.events[req_id]
     
@@ -556,133 +576,72 @@ async def chat_completions(request: ChatCompletionRequest):
             "finish_reason": "stop"
         }]
     }
-
+    
+    
+# 修改 completions 接口
 @app.post("/v1/completions")
 async def completions(request: CompletionRequest):
     req_id_base = str(uuid.uuid4())
+    prompts = [request.prompt] if isinstance(request.prompt, str) else request.prompt
     is_ll = (request.logprobs is not None and request.logprobs > 0)
     
-    is_batch = isinstance(request.prompt, list)
-    
-    if is_batch:
-        # ========== 批量请求处理 ==========
-        prompts = request.prompt
-        
-        # 1. 批量编码所有prompts
-        encoded = engine.tokenizer(prompts, padding=True, return_tensors="pt")
-        all_input_ids = encoded.input_ids
-        
-        # 2. 动态计算cont_len：基于最长序列长度
-        max_input_len = all_input_ids.shape[1]
-        cont_len = max_input_len if is_ll else 2048  # loglikelihood需要精确长度
-        
-        # 3. 创建批量请求ID列表
-        batch_ids = [f"{req_id_base}-{i}" for i in range(len(prompts))]
-        
-        # 4. 创建批量事件
-        events = {rid: asyncio.Event() for rid in batch_ids}
-        engine.events.update(events)
-        
-        # 5. 发送批量请求（单个批量请求，包含所有prompts）
+    # 1. 明确 Tokenizer 编码后的设备 (建议保持 CPU 以处理字符串转换，但在比较时需注意)
+    encoded = engine.tokenizer(prompts, padding=True, return_tensors="pt")
+    # 保持在 CPU 上用于 convert_ids_to_tokens 这种 CPU 密集型操作
+    all_input_ids = encoded.input_ids 
+
+    events, results_ids = [], []
+    for i, p in enumerate(prompts):
+        rid = f"{req_id_base}-{i}"
+        ev = asyncio.Event(); engine.events[rid] = ev
+        events.append(ev); results_ids.append(rid)
         await engine.req_queue.put({
-            "type": "loglikelihood" if is_ll else "chat",
-            "batch_ids": batch_ids,  # 改为批量ID
-            "prompts": prompts,      # 批量prompts
-            "max_tokens": request.max_tokens,
-            "temp": request.temperature,
-            "top_p": request.top_p,
-            "cont_len": cont_len     # 动态长度
+            "type": "loglikelihood" if is_ll else "chat", 
+            "id": rid, "prompt": p, 
+            "max_tokens": request.max_tokens, 
+            "temp": request.temperature, "top_p": request.top_p, 
+            "rep_pen": request.repetition_penalty,
+            "cont_len": 8192
         })
-        
-        # 6. 等待所有批量结果完成
-        await asyncio.gather(*(events[rid].wait() for rid in batch_ids))
-        
-        # 7. 收集批量结果
-        choices = []
-        for i, rid in enumerate(batch_ids):
-            res = engine.results.pop(rid)
-            del engine.events[rid]
-            
-            if is_ll:
-                token_ids = all_input_ids[i]
-                tokens_str = engine.tokenizer.convert_ids_to_tokens(token_ids)
-                pad_id = engine.tokenizer.pad_token_id
-                
-                # 找到第一个非pad token
-                first_valid = (token_ids != pad_id).long().argmax().item()
-                
-                valid_tokens = tokens_str[first_valid:]
-                valid_logprobs = res[first_valid:]
-                
-                top_lp = [{t: lp} for t, lp in zip(valid_tokens, valid_logprobs)]
-                
-                choices.append({
-                    "text": prompts[i] if request.echo else "",
-                    "index": i,
-                    "logprobs": {
-                        "token_logprobs": valid_logprobs,
-                        "tokens": valid_tokens,
-                        "top_logprobs": top_lp
-                    },
-                    "finish_reason": "stop"
-                })
-            else:
-                choices.append({"text": res, "index": i, "finish_reason": "stop"})
-        
-        return {"id": req_id_base, "object": "text_completion", "choices": choices}
     
-    else:
-        # ========== 单请求处理==========
-        prompt = request.prompt
-        rid = req_id_base # 这是一个 UUID 字符串
-        event = asyncio.Event()
-        engine.events[rid] = event
-        
-        await engine.req_queue.put({
-            "type": "loglikelihood" if is_ll else "chat",
-            "id": rid,  # 【必须确保键名是 'id'】
-            "prompt": prompt,
-            "max_tokens": request.max_tokens,
-            "temp": request.temperature,
-            "top_p": request.top_p,
-            "cont_len": len(prompt) if is_ll else 2048
-        })
-        
-        await event.wait()
+    await asyncio.gather(*(ev.wait() for ev in events))
+    
+    choices = []
+    for i, rid in enumerate(results_ids):
         res = engine.results.pop(rid)
         del engine.events[rid]
         
-        # 单结果处理
         if is_ll:
-            # 为单请求重新编码以获取token信息
-            encoded = engine.tokenizer([prompt], padding=True, return_tensors="pt")
-            token_ids = encoded.input_ids[0]
+            token_ids = all_input_ids[i] # 位于 CPU
             tokens_str = engine.tokenizer.convert_ids_to_tokens(token_ids)
+            
+            # 2. 这里的逻辑在 CPU 执行，不会报错，但为了严谨，
+            # 如果 pad_token_id 很大或涉及复杂 Tensor 操作，建议加上 .to(token_ids.device)
             pad_id = engine.tokenizer.pad_token_id
             
-            # 找到第一个非pad token
+            # 找到第一个非 pad token
+            # 直接在 CPU 向量化计算
             first_valid = (token_ids != pad_id).long().argmax().item()
             
             valid_tokens = tokens_str[first_valid:]
             valid_logprobs = res[first_valid:]
             
             top_lp = [{t: lp} for t, lp in zip(valid_tokens, valid_logprobs)]
-            
-            choices = [{
-                "text": prompt if request.echo else "",
-                "index": 0,
+
+            choices.append({
+                "text": prompts[i] if request.echo else "", 
+                "index": i, 
                 "logprobs": {
-                    "token_logprobs": valid_logprobs,
-                    "tokens": valid_tokens,
+                    "token_logprobs": valid_logprobs, 
+                    "tokens": valid_tokens, 
                     "top_logprobs": top_lp
-                },
+                }, 
                 "finish_reason": "stop"
-            }]
+            })
         else:
-            choices = [{"text": res, "index": 0, "finish_reason": "stop"}]
-        
-        return {"id": req_id_base, "object": "text_completion", "choices": choices}
-    
+            choices.append({"text": res, "index": i, "finish_reason": "stop"})
+            
+    return {"id": req_id_base, "object": "text_completion", "choices": choices}
 
 def main():
     parser = argparse.ArgumentParser()
