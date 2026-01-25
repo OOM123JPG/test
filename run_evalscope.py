@@ -24,39 +24,39 @@ def run_winogrande_evaluation():
     
     task_cfg = TaskConfig(
         model='deepseek-v3-tucker',
-        eval_type='distributed_deepseek',
-        api_url='http://127.0.0.1:8888',
+        eval_type='openai_api',
+        api_url='http://127.0.0.1:8888/v1',
         datasets=['winogrande'],
-        # 通过dataset_args指定本地数据集路径
-        dataset_args={
-            'winogrande': {
-                'local_path': '/data/yuebin/tdmoe/test/data/AI-ModelScope___winogrande_val/default-8f579396871af816/0.0.0/master',  # 本地数据集路径
-                'subset_list': ['validation']  # 指定要评测的子集
-            }
-        },
+        # dataset_args={
+        #     'winogrande': {
+        #         # 'local_path': '/data/yuebin/tdmoe/test/data/AI-ModelScope___winogrande_val/default-8f579396871af816/0.0.0/master',  # 本地数据集路径
+        #         # 'subset_list': ['validation']  # 指定要评测的子集
+        #         "few_shot_num": 5
+        #     }
+        # },
         generation_config={
             'max_tokens': 5,
             'temperature': 0.0,
             'logprobs': 1,
         },
         no_timestamp=True,
-        eval_batch_size=16,
-        limit=100,
+        eval_batch_size=1,
+        limit=10,
         work_dir=f'{work_dir_base}/winogrande',
-        use_cache=f'{work_dir_base}/winogrande'
+        # use_cache=f'{work_dir_base}/winogrande'
     )
     
     try:
         run_task(task_cfg)
         print("✓ Winogrande evaluation completed successfully")
         
-        # 读取结果
-        report_path = os.path.join(work_dir_base, 'winogrande', 'reports', 'deepseek-v3-tucker', 'winogrande.json')
-        if os.path.exists(report_path):
-            with open(report_path, 'r') as f:
-                data = json.load(f)
-                acc = data.get('results', [{}])[0].get('score', 'N/A')
-                print(f"Winogrande 准确率: {acc}")
+    #     # 读取结果
+    #     report_path = os.path.join(work_dir_base, 'winogrande', 'reports', 'deepseek-v3-tucker', 'winogrande.json')
+    #     if os.path.exists(report_path):
+    #         with open(report_path, 'r') as f:
+    #             data = json.load(f)
+    #             acc = data.get('results', [{}])[0].get('score', 'N/A')
+    #             print(f"Winogrande result: {data}")
                 
     except Exception as e:
         print(f"✗ Winogrande evaluation failed: {e}")
@@ -69,7 +69,7 @@ def run_piqa_evaluation():
     
     task_cfg = TaskConfig(
         model='deepseek-v3-tucker',
-        eval_type='distributed_deepseek',
+        eval_type='openai_api',
         api_url='http://127.0.0.1:8888',
         datasets=['piqa'],
         dataset_args={
@@ -103,13 +103,61 @@ def run_piqa_evaluation():
     except Exception as e:
         print(f"✗ PIQA evaluation failed: {e}")
 
-def run_arc_evaluation():
+# def run_arc_evaluation():
+#     """运行ARC评测 - 使用本地数据集"""
+#     print("\n" + "="*50)
+#     print(">>> 开始评测 ARC (本地数据集)")
+#     print("="*50)
+    
+#     for arc_type, arc_name in [('ARC-Easy', 'ARC-Easy'), ('ARC-Challenge', 'ARC-Challenge')]:
+#         print(f"\n>>> 评测 {arc_name}")
+        
+#         task_cfg = TaskConfig(
+#             model='deepseek-v3-tucker', 
+#             eval_type='openai_api',
+#             api_url='http://127.0.0.1:8888/v1',
+#             datasets=['arc'],
+#             dataset_args={
+#                 'arc': {
+#                     # 'local_path': f'/path/to/your/local/arc/{arc_type.lower().replace("-", "_")}/dataset',
+#                     'subset_list': [arc_type]
+#                 }
+#             },
+#             debug=True,
+#             generation_config={
+#                 'max_tokens': 256,
+#                 'temperature': 0.0,
+#             },
+#             no_timestamp=True,
+#             eval_batch_size=1,
+#             limit=10,
+#             work_dir=f'{work_dir_base}/arc_{arc_type.lower().replace("-", "_")}',
+#             # use_cache=f'{work_dir_base}/arc_{arc_type.lower().replace("-", "_")}'
+#         )
+        
+#         try:
+#             run_task(task_cfg)
+#             print(f"✓ {arc_name} evaluation completed successfully")
+            
+#             report_path = os.path.join(work_dir_base, f'arc_{arc_type.lower().replace("-", "_")}', 
+#                                      'reports', 'deepseek-v3-tucker', 'arc.json')
+#             if os.path.exists(report_path):
+#                 with open(report_path, 'r') as f:
+#                     data = json.load(f)
+#                     acc = data.get('results', [{}])[0].get('score', 'N/A')
+#                     print(f"{arc_name} 准确率: {acc}")
+                    
+#         except Exception as e:
+#             print(f"✗ {arc_name} evaluation failed: {e}")
+
+
+def run_arc_e_evaluation():
     """运行ARC评测 - 使用本地数据集"""
     print("\n" + "="*50)
     print(">>> 开始评测 ARC (本地数据集)")
     print("="*50)
     
-    for arc_type, arc_name in [('ARC-Easy', 'ARC-Easy'), ('ARC-Challenge', 'ARC-Challenge')]:
+    for arc_type, arc_name in [('ARC-Easy', 'ARC-Easy')]:
         print(f"\n>>> 评测 {arc_name}")
         
         task_cfg = TaskConfig(
@@ -129,8 +177,8 @@ def run_arc_evaluation():
                 'temperature': 0.0,
             },
             no_timestamp=True,
-            eval_batch_size=1,
-            limit=10,
+            eval_batch_size=8,
+            limit=16,
             work_dir=f'{work_dir_base}/arc_{arc_type.lower().replace("-", "_")}',
             # use_cache=f'{work_dir_base}/arc_{arc_type.lower().replace("-", "_")}'
         )
@@ -149,6 +197,7 @@ def run_arc_evaluation():
                     
         except Exception as e:
             print(f"✗ {arc_name} evaluation failed: {e}")
+            
 
 def run_mmlu_evaluation():
     """运行MMLU评测 - 使用本地数据集"""
@@ -167,7 +216,7 @@ def run_mmlu_evaluation():
         
         task_cfg = TaskConfig(
             model='deepseek-v3-tucker', 
-            eval_type='distributed_deepseek',
+            eval_type='openai_api',
             api_url='http://127.0.0.1:8888',
             datasets=['mmlu'],
             dataset_args={
@@ -219,7 +268,7 @@ def run_ceval_evaluation():
         
         task_cfg = TaskConfig(
             model='deepseek-v3-tucker',
-            eval_type='distributed_deepseek',
+            eval_type='openai_api',
             api_url='http://127.0.0.1:8888',
             datasets=['ceval'],
             dataset_args={
@@ -261,7 +310,7 @@ def run_all_evaluations():
     print("开始运行所有评测...")
     print("请确保以下条件满足：")
     print("1. api_inference.py 服务正在运行在 http://127.0.0.1:8888")
-    print("2. model_adapter.py 已导入并注册了 distributed_deepseek 适配器")
+    print("2. model_adapter.py 已导入并注册了 openai_api 适配器")
     print("3. 本地数据集文件已准备好（HuggingFace格式）")
     print("="*80)
     
@@ -271,7 +320,7 @@ def run_all_evaluations():
         run_piqa_evaluation()
         
         # 科学知识评测
-        run_arc_evaluation()
+        run_arc_e_evaluation()
         
         # 学术能力评测
         run_mmlu_evaluation()
@@ -288,7 +337,7 @@ if __name__ == '__main__':
     # 可以选择运行单个评测或全部评测
     # run_winogrande_evaluation()
     # run_piqa_evaluation()
-    run_arc_evaluation()
+    run_arc_e_evaluation()
     # run_mmlu_evaluation()
     # run_ceval_evaluation()
     

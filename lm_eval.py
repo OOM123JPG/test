@@ -13,10 +13,10 @@ logger = logging.getLogger(__name__)
 
 # 1. LMEH 通用任务 (通常为 0-shot)
 general_tasks = [
-    "winogrande",
-    "piqa",
+    # "winogrande",
+    # "piqa",
     "arc_easy",
-    "arc_challenge"
+    # "arc_challenge"
 ]
 
 # 2. MMLU 任务 (STEM 类别，需要 fewshot=5)
@@ -57,7 +57,7 @@ def run_api_eval(
     model_name: str,
     base_url: str,
     tokenizer_path: str,
-    output_dir: str,  # 外面传进来的基础路径
+    output_dir: str,
     task_names: list = None,
     batch_size: int = 1,
     num_concurrent: int = 10,
@@ -129,7 +129,7 @@ def run_api_eval(
         print(f"\n>>> 任务 {task} 结果预览:\n{df_row}\n{'-'*30}")
 
         # 5. 保存结果：写入 CSV (追加模式)
-        df_row.to_csv(csv_path, index=False, mode='a', header=not os.path.exists(csv_path))
+        # df_row.to_csv(csv_path, index=False, mode='a', header=not os.path.exists(csv_path))        
         
         # 6. 保存结果：写入详细 JSON (包含 samples)
         json_output_path = os.path.join(details_dir, f"detail_{task}.json")
@@ -143,16 +143,18 @@ def run_api_eval(
 
 if __name__ == "__main__":
     # 统一路径配置
-    BASE_OUTPUT_PATH = "/nfs-share/wx1463835/tdmoe/output/evaluation"
+    # BASE_OUTPUT_PATH = "/nfs-share/wx1463835/tdmoe/output/evaluation"
+    BASE_OUTPUT_PATH = "/home/GZGKD001/tmp/yanhong/tdmoe_deepseek/output/evaluation"
     
     COMMON_CONFIG = {
         "model_name": "deepseek-v3-tucker",
-        "tokenizer_path": "/nfs-share/wx1463835/download/model/DeepSeek-V3-bf16",
+        # "tokenizer_path": "/nfs-share/wx1463835/download/model/DeepSeek-V3-bf16",
+        "tokenizer_path": "/home/GZGKD001/tmp/models/DeepSeek-V3-bf16",
         "base_url": "http://127.0.0.1:8888/v1/completions",
         "output_dir": BASE_OUTPUT_PATH, # 传入基础路径
-        "num_concurrent": 10,
+        "num_concurrent": 1,
         "batch_size": 1,
-        "limit": None,
+        "limit": 8,
         "temperature": 0.0,
     }
 
@@ -160,19 +162,19 @@ if __name__ == "__main__":
     eval_groups = {
         "LMEH 通用任务": {
             "tasks": general_tasks,
-            "num_fewshot": 0,
-            "max_gen_toks": 16,
-        },
-        "MMLU 任务": {
-            "tasks": mmlu_tasks,
             "num_fewshot": 5,
             "max_gen_toks": 16,
         },
-        "C-Eval 任务": {
-            "tasks": ceval_tasks,
-            "num_fewshot": 5,
-            "max_gen_toks": 256,
-        },
+        # "MMLU 任务": {
+        #     "tasks": mmlu_tasks,
+        #     "num_fewshot": 5,
+        #     "max_gen_toks": 16,
+        # },
+        # "C-Eval 任务": {
+        #     "tasks": ceval_tasks,
+        #     "num_fewshot": 5,
+        #     "max_gen_toks": 256,
+        # },
     }
 
     for group_name, config in eval_groups.items():

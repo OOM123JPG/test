@@ -36,6 +36,15 @@ curl http://localhost:8888/v1/completions \
     "temperature": 0.0
   }'
 
+curl http://localhost:8888/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "deepseek-v3-tucker",
+    "prompt": ["The capital of France is Paris", "The capital of Japan is Tokyo"],
+    "logprobs": 1,
+    "max_tokens": 0,
+    "echo": true
+  }'
   
 # curl -X POST http://127.0.0.1:8888/v1/chat/completions \
 #    -H "Content-Type: application/json" \
