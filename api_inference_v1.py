@@ -269,7 +269,7 @@ class DistributedInferenceEngine:
                 try:
                     req = await asyncio.wait_for(self.req_queue.get(), timeout=0.1)
                     active_reqs.append(req)
-                    while not self.req_queue.empty() and len(active_reqs) < 8:
+                    while not self.req_queue.empty() and len(active_reqs) < 64:
                         active_reqs.append(self.req_queue.get_nowait())
                 except asyncio.TimeoutError:
                     dist.broadcast(torch.tensor([0], dtype=torch.long, device="npu:0"), src=0)
