@@ -70,7 +70,7 @@ def run_piqa_evaluation():
     task_cfg = TaskConfig(
         model='deepseek-v3-tucker',
         eval_type='openai_api',
-        api_url='http://127.0.0.1:8888',
+        api_url='http://127.0.0.1:8888/v1',
         datasets=['piqa'],
         dataset_args={
             'piqa': {
@@ -199,13 +199,77 @@ def run_arc_e_evaluation():
             print(f"✗ {arc_name} evaluation failed: {e}")
             
 
+def run_arc_c_evaluation():
+    """运行ARC评测 - 使用本地数据集"""
+    print("\n" + "="*50)
+    print(">>> 开始评测 ARC (本地数据集)")
+    print("="*50)
+    
+    for arc_type, arc_name in [('ARC-Challenge', 'ARC-Challenge')]:
+        print(f"\n>>> 评测 {arc_name}")
+        
+        task_cfg = TaskConfig(
+            model='deepseek-v3-tucker', 
+            eval_type='openai_api',
+            api_url='http://127.0.0.1:8888/v1',
+            datasets=['arc'],
+            dataset_args={
+                'arc': {
+                    # 'local_path': f'/path/to/your/local/arc/{arc_type.lower().replace("-", "_")}/dataset',
+                    'subset_list': [arc_type]
+                }
+            },
+            debug=True,
+            generation_config={
+                'max_tokens': 256,
+                'temperature': 0.0,
+            },
+            no_timestamp=True,
+            eval_batch_size=8,
+            limit=8,
+            work_dir=f'{work_dir_base}/arc_{arc_type.lower().replace("-", "_")}',
+            # use_cache=f'{work_dir_base}/arc_{arc_type.lower().replace("-", "_")}'
+        )
+        
+        try:
+            run_task(task_cfg)
+            print(f"✓ {arc_name} evaluation completed successfully")
+            
+            report_path = os.path.join(work_dir_base, f'arc_{arc_type.lower().replace("-", "_")}', 
+                                     'reports', 'deepseek-v3-tucker', 'arc.json')
+            if os.path.exists(report_path):
+                with open(report_path, 'r') as f:
+                    data = json.load(f)
+                    acc = data.get('results', [{}])[0].get('score', 'N/A')
+                    print(f"{arc_name} 准确率: {acc}")
+                    
+        except Exception as e:
+            print(f"✗ {arc_name} evaluation failed: {e}")
+            
+            
+            
 def run_mmlu_evaluation():
     """运行MMLU评测 - 使用本地数据集"""
     print("\n" + "="*50)
     print(">>> 开始评测 MMLU (本地数据集)")
     print("="*50)
     
-    mmlu_subjects = ['astronomy', 'college_biology', 'college_chemistry']
+    mmlu_subjects = [
+        "astronomy",
+        "college_biology",
+        "college_chemistry",
+        "college_computer_science",
+        "college_mathematics",
+        "computer_security",
+        "conceptual_physics",
+        "electrical_engineering",
+        "high_school_biology",
+        "high_school_chemistry",
+        "high_school_computer_science",
+        "high_school_physics",
+        "high_school_statistics",
+        "machine_learning"
+    ]
     
     print(f">>> 将评测以下 {len(mmlu_subjects)} 个 MMLU 子集: {', '.join(mmlu_subjects)}")
     
@@ -217,11 +281,11 @@ def run_mmlu_evaluation():
         task_cfg = TaskConfig(
             model='deepseek-v3-tucker', 
             eval_type='openai_api',
-            api_url='http://127.0.0.1:8888',
+            api_url='http://127.0.0.1:8888/v1',
             datasets=['mmlu'],
             dataset_args={
                 'mmlu': {
-                    'local_path': f'/path/to/your/local/mmlu/{subject}/dataset',
+                    # 'local_path': f'/path/to/your/local/mmlu/{subject}/dataset',
                     'subset_list': [subject]
                 }
             },
@@ -230,8 +294,8 @@ def run_mmlu_evaluation():
                 'temperature': 0.0,
             },       
             no_timestamp=True,
-            eval_batch_size=4,
-            limit=50,
+            eval_batch_size=8,
+            limit=8,
             work_dir=subject_work_dir,
             use_cache=subject_work_dir
         )
@@ -269,7 +333,7 @@ def run_ceval_evaluation():
         task_cfg = TaskConfig(
             model='deepseek-v3-tucker',
             eval_type='openai_api',
-            api_url='http://127.0.0.1:8888',
+            api_url='http://127.0.0.1:8888/v1',
             datasets=['ceval'],
             dataset_args={
                 'ceval': {
@@ -338,6 +402,7 @@ if __name__ == '__main__':
     # run_winogrande_evaluation()
     # run_piqa_evaluation()
     run_arc_e_evaluation()
+    # run_arc_c_evaluation()
     # run_mmlu_evaluation()
     # run_ceval_evaluation()
     
