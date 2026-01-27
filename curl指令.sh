@@ -2,6 +2,33 @@ curl http://localhost:8888/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "deepseek-v3-tucker",
+    "messages": [{"role": "user", "content": "1+1等于几？"}],
+    "temperature": 0.0,
+    "max_tokens": 50
+  }'
+
+curl http://localhost:8888/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": ["北京的特产有哪些？", "用 Python 写一个快排。"],
+    "max_tokens": 128
+  }'
+  
+curl http://localhost:8888/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "deepseek-v3-tucker",
+    "messages": [{"role": "user", "content": "请详细解释为什么天空是蓝色的？"}],
+    "temperature": 0.7,
+    "repetition_penalty": 1.0,
+    "max_tokens": 500
+  }'
+
+
+curl http://localhost:8888/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "deepseek-v3-tucker",
     "messages": [
       {"role": "user", "content": "你好，请问你是谁？"}
     ],
