@@ -13,6 +13,21 @@ curl http://localhost:8888/v1/completions \
     "prompt": ["北京的特产有哪些？", "用 Python 写一个快排。"],
     "max_tokens": 128
   }'
+
+  curl http://localhost:8888/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "deepseek-v3-tucker",
+    "prompt": [
+        "请解释量子纠缠是什么。",
+        "如何评价深度学习在医学影像中的应用？",
+        "写一段关于未来城市的科幻小说开头。",
+        "分析全球气候变暖对生物多样性的影响。"
+    ],
+    "max_tokens": 128,
+    "temperature": 0.7,
+    "top_p": 0.9
+  }'
   
 curl http://localhost:8888/v1/chat/completions \
   -H "Content-Type: application/json" \
