@@ -10,6 +10,16 @@ curl http://localhost:8888/v1/chat/completions \
 curl http://localhost:8888/v1/completions \
   -H "Content-Type: application/json" \
   -d '{
+    "prompt": "北京的特产有哪些？",
+    "max_tokens": 50,
+    "temperature": 0.8,
+    "repetition_penalty": 1.2,
+    "top_p": 0.9
+  }'
+  
+curl http://localhost:8888/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{
     "prompt": ["北京的特产有哪些？", "用 Python 写一个快排。"],
     "max_tokens": 128
   }'
