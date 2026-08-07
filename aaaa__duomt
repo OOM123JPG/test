@@ -1,10 +1,15 @@
-python -V
-pip show evalscope openai pydantic requests vlmevalkit
-
-如果目标机 evalscope 不是 1.7.0，先对齐：
-pip uninstall -y evalscope vlmevalkit
-pip install 'evalscope[vlmeval]==1.7.0'
-更稳一点，把 OpenAI SDK 也跟源机器对齐。源机器上跑：
-pip show openai pydantic requests vlmevalkit
-然后目标机按源机器版本安装，比如：
-pip install 'openai==源机器版本' 'pydantic==源机器版本' 'requests==源机器版本'
+你在目标机跑完失败后，把这几个输出贴我：
+find outputs/evalscope_perf -path '*blink*' -name proxy.log -print | tail -5
+然后对最新那个：
+tail -200 outputs/evalscope_perf/你的模型/blink/proxy.log
+再看 proxy 记录有没有失败：
+tail -20 outputs/evalscope_perf/你的模型/blink/requests.jsonl
+最关键是完整 traceback 最后 40 行：
+# 直接复制终端里 JSONDecodeError 前后那段
+同时做一个“流式过 proxy 的 curl”测试，能判断 proxy 本身是否吐坏流：
+curl -N http://127.0.0.1:18011/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"你的MODEL_NAME","messages":[{"role":"user","content":"hi"}],"stream":true,"max_tokens":8}'
+如果这个 curl 过 proxy 都不正常，那就是 perf_proxy.py 的 HTTP/SSE 转发还不兼容目标机。
+如果 curl 过 proxy 正常，但 EvalScope 不正常，那就是 OpenAI SDK / EvalScope 解析链的问题。
+临时能继续测速度的路线是：非流式 proxy 测端到端 latency/throughput，没有 TTFT/TPOT，但速度对比是可用的。流式 TTFT/TPOT 现在必须靠 traceback 定位，不然就是摸黑打补丁。
