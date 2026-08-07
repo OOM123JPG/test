@@ -7,3 +7,16 @@ python eval/perf_proxy.py \
   --output-dir outputs/evalscope_perf/manual/blink \
   --model 你的MODEL_NAME \
   --dataset blink
+
+
+scripts/run_evalscope.sh \
+  --port 8011 \
+  --model 你的MODEL_NAME \
+  --datasets blink \
+  --data-dir /nfs-share/wx1463835_v2/cache/data \
+  --limit 1 \
+  --nproc 1 \
+  --stream \
+  --perf-proxy \
+  --perf-proxy-no-include-usage \
+  --no-reuse
