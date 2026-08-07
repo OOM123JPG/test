@@ -1,0 +1,599 @@
+#!/usr/bin/env python3
+"""OpenAI-compatible proxy that records request-level performance metrics."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import errno
+import json
+import re
+import statistics
+import sys
+import threading
+import time
+import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
+from urllib.parse import urljoin, urlparse
+
+import requests
+
+
+HOP_BY_HOP_HEADERS = {
+    "connection",
+    "content-encoding",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailers",
+    "transfer-encoding",
+    "upgrade",
+}
+
+CLIENT_DISCONNECT_ERRNOS = {
+    errno.EPIPE,
+    errno.ECONNRESET,
+    errno.ECONNABORTED,
+}
+
+
+def normalize_match_text(value: str) -> str:
+    return re.sub(r"\s+", " ", value).strip().lower()
+
+
+def iter_text_values(value: Any):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from iter_text_values(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from iter_text_values(item)
+
+
+class TaskTypeInjector:
+    def __init__(self, dataset: str, data_path: Path | None) -> None:
+        self.dataset = dataset.lower()
+        self.data_path = data_path
+        self.enabled = data_path is not None
+        self.question_to_category: dict[str, str] = {}
+        self.index_to_category: dict[str, str] = {}
+        self.questions_by_length: list[tuple[str, str]] = []
+        if data_path is not None:
+            self.load_blink_tsv(data_path)
+
+    @classmethod
+    def disabled(cls) -> "TaskTypeInjector":
+        return cls("", None)
+
+    def load_blink_tsv(self, data_path: Path) -> None:
+        csv.field_size_limit(sys.maxsize)
+        with data_path.open("r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f, delimiter="\t")
+            for row in reader:
+                category = row.get("category")
+                question = row.get("question")
+                index = row.get("index")
+                if not category:
+                    continue
+                if question:
+                    normalized = normalize_match_text(question)
+                    if normalized:
+                        self.question_to_category[normalized] = category
+                if index:
+                    self.index_to_category[str(index)] = category
+        self.questions_by_length = sorted(
+            self.question_to_category.items(),
+            key=lambda item: len(item[0]),
+            reverse=True,
+        )
+
+    def infer_task_type(self, request_json: dict[str, Any]) -> tuple[str | None, str | None]:
+        if not self.enabled or self.dataset != "blink":
+            return None, None
+        if request_json.get("task_type"):
+            return str(request_json["task_type"]), "existing"
+
+        messages = request_json.get("messages", [])
+        text = "\n".join(iter_text_values(messages))
+        normalized = normalize_match_text(text)
+        if not normalized:
+            return None, "empty_text"
+
+        for index, category in self.index_to_category.items():
+            if index in text:
+                return category, "index"
+
+        for question, category in self.questions_by_length:
+            if question and question in normalized:
+                return category, "question_substring"
+
+        return None, "not_matched"
+
+    def inject(self, request_json: dict[str, Any]) -> tuple[dict[str, Any], str | None, str | None]:
+        task_type, source = self.infer_task_type(request_json)
+        if task_type and not request_json.get("task_type"):
+            request_json["task_type"] = task_type
+        return request_json, task_type, source
+
+
+class PerfRecorder:
+    def __init__(self, output_dir: Path, model: str, dataset: str) -> None:
+        self.output_dir = output_dir
+        self.model = model
+        self.dataset = dataset
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.requests_path = self.output_dir / "requests.jsonl"
+        self.summary_path = self.output_dir / "summary.json"
+        self._lock = threading.Lock()
+        self._records: list[dict[str, Any]] = []
+
+    def record(self, record: dict[str, Any]) -> None:
+        record.setdefault("model", self.model)
+        record.setdefault("dataset", self.dataset)
+        line = json.dumps(record, ensure_ascii=False)
+        with self._lock:
+            self._records.append(record)
+            with self.requests_path.open("a", encoding="utf-8") as f:
+                f.write(line + "\n")
+                f.flush()
+            self.write_summary_locked()
+
+    def write_summary_locked(self) -> None:
+        records = [r for r in self._records if r.get("backend_success", r.get("success"))]
+        backend_failed = len(self._records) - len(records)
+        client_delivery_failed = sum(1 for r in self._records if r.get("client_error"))
+        client_disconnected = sum(1 for r in self._records if r.get("client_disconnected"))
+        if not self._records:
+            summary = {
+                "model": self.model,
+                "dataset": self.dataset,
+                "completed": 0,
+                "failed": 0,
+                "backend_failed": 0,
+                "client_delivery_failed": 0,
+                "client_disconnected": 0,
+            }
+        else:
+            first_start = min(float(r["start_time"]) for r in self._records)
+            last_end = max(float(r["end_time"]) for r in self._records)
+            duration = max(last_end - first_start, 1e-9)
+            output_tokens = sum(int(r.get("output_tokens") or 0) for r in records)
+            input_tokens = sum(int(r.get("input_tokens") or 0) for r in records)
+            latencies = [float(r["latency_s"]) for r in records if r.get("latency_s") is not None]
+            ttfts = [float(r["ttft_ms"]) for r in records if r.get("ttft_ms") is not None]
+            tpots = [float(r["tpot_ms"]) for r in records if r.get("tpot_ms") is not None]
+            summary = {
+                "model": self.model,
+                "dataset": self.dataset,
+                "completed": len(records),
+                "failed": backend_failed,
+                "backend_failed": backend_failed,
+                "client_delivery_failed": client_delivery_failed,
+                "client_disconnected": client_disconnected,
+                "duration_s": duration,
+                "request_throughput": len(records) / duration,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "output_token_throughput": output_tokens / duration,
+                "total_token_throughput": (input_tokens + output_tokens) / duration,
+                "mean_latency_s": mean_or_none(latencies),
+                "median_latency_s": median_or_none(latencies),
+                "mean_ttft_ms": mean_or_none(ttfts),
+                "median_ttft_ms": median_or_none(ttfts),
+                "mean_tpot_ms": mean_or_none(tpots),
+                "median_tpot_ms": median_or_none(tpots),
+            }
+        with self.summary_path.open("w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+
+
+def mean_or_none(values: list[float]) -> float | None:
+    return statistics.fmean(values) if values else None
+
+
+def median_or_none(values: list[float]) -> float | None:
+    return statistics.median(values) if values else None
+
+
+def filtered_headers(headers) -> dict[str, str]:
+    return {
+        key: value
+        for key, value in headers.items()
+        if key.lower() not in HOP_BY_HOP_HEADERS and key.lower() not in {"host", "accept-encoding"}
+    }
+
+
+def upstream_headers(headers) -> dict[str, str]:
+    forwarded = filtered_headers(headers)
+    forwarded["Accept-Encoding"] = "identity"
+    return forwarded
+
+
+def target_url_for(base_url: str, request_path: str) -> str:
+    parsed = urlparse(base_url)
+    if request_path.endswith("/v1/models"):
+        return urljoin(f"{parsed.scheme}://{parsed.netloc}", "/v1/models")
+    return base_url
+
+
+def parse_sse_payload(line: bytes) -> dict[str, Any] | None:
+    if not line.startswith(b"data:"):
+        return None
+    payload = line[len(b"data:") :].strip()
+    if not payload or payload == b"[DONE]":
+        return None
+    try:
+        return json.loads(payload.decode("utf-8"))
+    except Exception:
+        return None
+
+
+def extract_delta_text(chunk: dict[str, Any]) -> str:
+    pieces = []
+    for choice in chunk.get("choices") or []:
+        delta = choice.get("delta") or {}
+        content = delta.get("content")
+        if isinstance(content, str):
+            pieces.append(content)
+    return "".join(pieces)
+
+
+def usage_from_payload(payload: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    usage = payload.get("usage")
+    return usage if isinstance(usage, dict) else {}
+
+
+def is_client_disconnect(exc: BaseException) -> bool:
+    if isinstance(exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)):
+        return True
+    return getattr(exc, "errno", None) in CLIENT_DISCONNECT_ERRNOS
+
+
+def make_handler(
+    target_url: str,
+    recorder: PerfRecorder,
+    include_usage: bool,
+    task_type_injector: TaskTypeInjector | None = None,
+):
+    injector = task_type_injector or TaskTypeInjector.disabled()
+
+    class ProxyHandler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def handle(self) -> None:
+            try:
+                super().handle()
+            except Exception as exc:
+                if is_client_disconnect(exc):
+                    self.close_connection = True
+                    return
+                raise
+
+        def log_message(self, format: str, *args) -> None:  # noqa: A002
+            return
+
+        def do_GET(self) -> None:
+            self.forward_non_stream("GET", record_metrics=False)
+
+        def do_POST(self) -> None:
+            content_length = int(self.headers.get("Content-Length", "0") or "0")
+            body = self.rfile.read(content_length) if content_length else b""
+            request_json: dict[str, Any] | None = None
+            try:
+                request_json = json.loads(body.decode("utf-8")) if body else None
+            except Exception:
+                request_json = None
+
+            injected_task_type = None
+            task_type_source = None
+            if isinstance(request_json, dict):
+                request_json, injected_task_type, task_type_source = injector.inject(request_json)
+                body = json.dumps(request_json, ensure_ascii=False).encode("utf-8")
+
+            if (
+                include_usage
+                and isinstance(request_json, dict)
+                and request_json.get("stream") is True
+            ):
+                stream_options = request_json.setdefault("stream_options", {})
+                if isinstance(stream_options, dict):
+                    stream_options.setdefault("include_usage", True)
+                    body = json.dumps(request_json).encode("utf-8")
+
+            if isinstance(request_json, dict) and request_json.get("stream") is True:
+                self.forward_stream(body, request_json, injected_task_type, task_type_source)
+            else:
+                self.forward_non_stream(
+                    "POST",
+                    body,
+                    request_json,
+                    injected_task_type,
+                    task_type_source,
+                    record_metrics=self.path.rstrip("/").endswith("/chat/completions"),
+                )
+
+        def forward_non_stream(
+            self,
+            method: str,
+            body: bytes | None = None,
+            request_json: dict[str, Any] | None = None,
+            injected_task_type: str | None = None,
+            task_type_source: str | None = None,
+            record_metrics: bool = True,
+        ) -> None:
+            start = time.perf_counter()
+            wall_start = time.time()
+            request_id = str(uuid.uuid4())
+            backend_error = None
+            client_error = None
+            output_tokens = None
+            input_tokens = None
+            status_code = 502
+            response = None
+            response_body = b""
+            try:
+                response = requests.request(
+                    method,
+                    target_url_for(target_url, self.path),
+                    headers=upstream_headers(self.headers),
+                    data=body,
+                    timeout=None,
+                )
+                status_code = response.status_code
+                response_body = response.content
+                try:
+                    payload = response.json()
+                    usage = usage_from_payload(payload)
+                    output_tokens = usage.get("completion_tokens")
+                    input_tokens = usage.get("prompt_tokens")
+                except Exception:
+                    pass
+            except Exception as exc:
+                backend_error = repr(exc)
+                payload = json.dumps({"error": backend_error}).encode("utf-8")
+                response_body = payload
+                status_code = 502
+
+            try:
+                self.send_response(status_code)
+                if response is not None:
+                    for key, value in response.headers.items():
+                        if key.lower() not in HOP_BY_HOP_HEADERS and key.lower() != "content-length":
+                            self.send_header(key, value)
+                else:
+                    self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(response_body)))
+                self.end_headers()
+                self.wfile.write(response_body)
+                self.wfile.flush()
+            except Exception as exc:
+                if is_client_disconnect(exc):
+                    client_error = repr(exc)
+                    self.close_connection = True
+                else:
+                    backend_error = backend_error or repr(exc)
+            finally:
+                end = time.perf_counter()
+                if record_metrics:
+                    backend_success = backend_error is None and status_code < 400
+                    client_disconnected = client_error is not None
+                    recorder.record(
+                        {
+                            "request_id": request_id,
+                            "start_time": wall_start,
+                            "end_time": time.time(),
+                            "latency_s": end - start,
+                            "ttft_ms": None,
+                            "tpot_ms": None,
+                            "input_tokens": input_tokens,
+                            "output_tokens": output_tokens,
+                            "stream": False,
+                            "status_code": status_code,
+                            "success": backend_success,
+                            "backend_success": backend_success,
+                            "client_delivered": backend_success and client_error is None,
+                            "client_disconnected": client_disconnected,
+                            "error": backend_error,
+                            "client_error": client_error,
+                            "request_model": request_json.get("model") if isinstance(request_json, dict) else None,
+                            "request_task_type": injected_task_type,
+                            "task_type_source": task_type_source,
+                        }
+                    )
+
+        def forward_stream(
+            self,
+            body: bytes,
+            request_json: dict[str, Any],
+            injected_task_type: str | None = None,
+            task_type_source: str | None = None,
+        ) -> None:
+            start = time.perf_counter()
+            wall_start = time.time()
+            request_id = str(uuid.uuid4())
+            first_token_time = None
+            output_text_parts: list[str] = []
+            output_tokens = None
+            input_tokens = None
+            status_code = 502
+            backend_error = None
+            client_error = None
+            downstream_closed = False
+
+            try:
+                with requests.post(
+                    target_url_for(target_url, self.path),
+                    headers=upstream_headers(self.headers),
+                    data=body,
+                    stream=True,
+                    timeout=None,
+                ) as response:
+                    status_code = response.status_code
+                    try:
+                        self.send_response(status_code)
+                        for key, value in response.headers.items():
+                            if key.lower() not in HOP_BY_HOP_HEADERS and key.lower() != "content-length":
+                                self.send_header(key, value)
+                        self.send_header("Transfer-Encoding", "chunked")
+                        self.end_headers()
+                    except Exception as exc:
+                        if is_client_disconnect(exc):
+                            client_error = repr(exc)
+                            downstream_closed = True
+                            self.close_connection = True
+                        else:
+                            raise
+
+                    for line in response.iter_lines(decode_unicode=False):
+                        payload = parse_sse_payload(line)
+                        if payload is not None:
+                            usage = usage_from_payload(payload)
+                            if usage:
+                                output_tokens = usage.get("completion_tokens", output_tokens)
+                                input_tokens = usage.get("prompt_tokens", input_tokens)
+                            text = extract_delta_text(payload)
+                            if text:
+                                if first_token_time is None:
+                                    first_token_time = time.perf_counter()
+                                output_text_parts.append(text)
+                        if not downstream_closed:
+                            try:
+                                self.write_chunk(line + b"\r\n\r\n")
+                            except Exception as exc:
+                                if is_client_disconnect(exc):
+                                    client_error = repr(exc)
+                                    downstream_closed = True
+                                    self.close_connection = True
+                                else:
+                                    raise
+                    if not downstream_closed:
+                        try:
+                            self.write_last_chunk()
+                        except Exception as exc:
+                            if is_client_disconnect(exc):
+                                client_error = repr(exc)
+                                downstream_closed = True
+                                self.close_connection = True
+                            else:
+                                raise
+            except Exception as exc:
+                backend_error = repr(exc)
+                if not downstream_closed:
+                    try:
+                        self.write_last_chunk()
+                    except Exception as write_exc:
+                        if is_client_disconnect(write_exc):
+                            client_error = repr(write_exc)
+                            downstream_closed = True
+                            self.close_connection = True
+                        else:
+                            backend_error = backend_error or repr(write_exc)
+            finally:
+                end = time.perf_counter()
+                generated_text = "".join(output_text_parts)
+                if output_tokens is None and generated_text:
+                    output_tokens = len(generated_text.split())
+                    token_count_source = "whitespace_fallback"
+                else:
+                    token_count_source = "usage" if output_tokens is not None else "missing"
+                ttft_ms = None
+                tpot_ms = None
+                if first_token_time is not None:
+                    ttft_ms = (first_token_time - start) * 1000.0
+                    if output_tokens and output_tokens > 1:
+                        tpot_ms = ((end - first_token_time) / (output_tokens - 1)) * 1000.0
+                backend_success = backend_error is None and status_code < 400
+                client_disconnected = client_error is not None
+                recorder.record(
+                    {
+                        "request_id": request_id,
+                        "start_time": wall_start,
+                        "end_time": time.time(),
+                        "latency_s": end - start,
+                        "ttft_ms": ttft_ms,
+                        "tpot_ms": tpot_ms,
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                        "output_chars": len(generated_text),
+                        "token_count_source": token_count_source,
+                        "stream": True,
+                        "status_code": status_code,
+                        "success": backend_success,
+                        "backend_success": backend_success,
+                        "client_delivered": backend_success and client_error is None,
+                        "client_disconnected": client_disconnected,
+                        "error": backend_error,
+                        "client_error": client_error,
+                        "request_model": request_json.get("model"),
+                        "request_task_type": injected_task_type,
+                        "task_type_source": task_type_source,
+                    }
+                )
+
+        def write_chunk(self, data: bytes) -> None:
+            if not data:
+                return
+            self.wfile.write(f"{len(data):X}\r\n".encode("ascii"))
+            self.wfile.write(data)
+            self.wfile.write(b"\r\n")
+            self.wfile.flush()
+
+        def write_last_chunk(self) -> None:
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+
+    return ProxyHandler
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Perf-recording proxy for OpenAI-compatible APIs")
+    parser.add_argument("--listen-host", default="127.0.0.1")
+    parser.add_argument("--listen-port", type=int, required=True)
+    parser.add_argument("--target-url", required=True)
+    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--dataset", required=True)
+    parser.add_argument("--no-include-usage", action="store_true")
+    parser.add_argument("--task-type-inject", action="store_true", help="Inject task_type into chat requests when dataset metadata is available")
+    parser.add_argument("--task-type-data", default="", help="TSV with BLINK question/category columns for task_type injection")
+    args = parser.parse_args()
+
+    recorder = PerfRecorder(Path(args.output_dir), args.model, args.dataset)
+    task_type_injector = TaskTypeInjector.disabled()
+    if args.task_type_inject:
+        if not args.task_type_data:
+            raise SystemExit("--task-type-inject requires --task-type-data")
+        task_type_injector = TaskTypeInjector(args.dataset, Path(args.task_type_data).expanduser().resolve())
+    handler = make_handler(
+        args.target_url,
+        recorder,
+        include_usage=not args.no_include_usage,
+        task_type_injector=task_type_injector,
+    )
+    server = ThreadingHTTPServer((args.listen_host, args.listen_port), handler)
+    print(
+        f"perf proxy listening on http://{args.listen_host}:{args.listen_port}; "
+        f"target={args.target_url}; output={args.output_dir}; "
+        f"task_type_inject={args.task_type_inject}; "
+        f"task_type_data={args.task_type_data or '<none>'}; "
+        f"task_type_questions={len(task_type_injector.question_to_category)}",
+        flush=True,
+    )
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()
