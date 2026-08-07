@@ -452,9 +452,17 @@ def make_handler(
                         else:
                             raise
 
-                    for line in response.iter_lines(decode_unicode=False):
-                        payload = parse_sse_payload(line)
-                        if payload is not None:
+                    pending = b""
+                    for chunk in response.iter_content(chunk_size=8192):
+                        if not chunk:
+                            continue
+
+                        pending += chunk
+                        while b"\n" in pending:
+                            line, pending = pending.split(b"\n", 1)
+                            payload = parse_sse_payload(line.strip())
+                            if payload is None:
+                                continue
                             usage = usage_from_payload(payload)
                             if usage:
                                 output_tokens = usage.get("completion_tokens", output_tokens)
@@ -464,9 +472,10 @@ def make_handler(
                                 if first_token_time is None:
                                     first_token_time = time.perf_counter()
                                 output_text_parts.append(text)
+
                         if not downstream_closed:
                             try:
-                                self.write_chunk(line + b"\r\n\r\n")
+                                self.write_chunk(chunk)
                             except Exception as exc:
                                 if is_client_disconnect(exc):
                                     client_error = repr(exc)
