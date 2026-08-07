@@ -1,0 +1,9 @@
+cd 你的text_svd项目目录
+
+python eval/perf_proxy.py \
+  --listen-host 127.0.0.1 \
+  --listen-port 18011 \
+  --target-url http://localhost:8011/v1/chat/completions \
+  --output-dir outputs/evalscope_perf/manual/blink \
+  --model 你的MODEL_NAME \
+  --dataset blink
