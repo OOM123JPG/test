@@ -1,22 +1,10 @@
-cd 你的text_svd项目目录
+python -V
+pip show evalscope openai pydantic requests vlmevalkit
 
-python eval/perf_proxy.py \
-  --listen-host 127.0.0.1 \
-  --listen-port 18011 \
-  --target-url http://localhost:8011/v1/chat/completions \
-  --output-dir outputs/evalscope_perf/manual/blink \
-  --model 你的MODEL_NAME \
-  --dataset blink
-
-
-scripts/run_evalscope.sh \
-  --port 8011 \
-  --model 你的MODEL_NAME \
-  --datasets blink \
-  --data-dir /nfs-share/wx1463835_v2/cache/data \
-  --limit 1 \
-  --nproc 1 \
-  --stream \
-  --perf-proxy \
-  --perf-proxy-no-include-usage \
-  --no-reuse
+如果目标机 evalscope 不是 1.7.0，先对齐：
+pip uninstall -y evalscope vlmevalkit
+pip install 'evalscope[vlmeval]==1.7.0'
+更稳一点，把 OpenAI SDK 也跟源机器对齐。源机器上跑：
+pip show openai pydantic requests vlmevalkit
+然后目标机按源机器版本安装，比如：
+pip install 'openai==源机器版本' 'pydantic==源机器版本' 'requests==源机器版本'
