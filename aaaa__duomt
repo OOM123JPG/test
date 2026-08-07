@@ -1,10 +1,1 @@
-cd /nfs-share/wx1463835_v2
-
-python eval/perf_proxy.py \
-  --listen-host 127.0.0.1 \
-  --listen-port 11008 \
-  --target-url http://localhost:1008/v1/chat/completions \
-  --output-dir outputs/evalscope_perf/manual/blink \
-  --model internvl2_8b \
-  --dataset blink \
-  --no-include-usage
+/home/GZGKD001/tmp/yanhong/text_svd/cache/data/modelscope/datasets/modelscope/MVBench
